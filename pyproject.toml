@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rmsnorm-h100"
+version = "0.1.2"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.scripts]
+rmsnorm-benchmark = "rmsnorm.benchmarks.benchmark_rmsnorm:main"
+
+[tool.setuptools]
+packages = ["rmsnorm", "rmsnorm.benchmarks"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+rmsnorm = ["csrc/*.cu", "csrc/*.cpp"]

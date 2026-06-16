@@ -1,0 +1,14 @@
+preset,dtype,M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup
+mid-backward,bfloat16,32768,16384,36,0.934867,1.147325,0.8148,0.2273
+mid-backward,float16,32768,16384,36,0.933622,1.114430,0.8378,0.1937
+large-backward,bfloat16,32768,65536,8,4.315051,5.086070,0.8484,0.1787
+large-backward,bfloat16,16384,131072,8,4.539361,6.008948,0.7554,0.3237
+large-backward,bfloat16,8192,262144,8,3.859709,5.175591,0.7458,0.3409
+large-backward,float16,32768,65536,8,4.342459,4.995056,0.8694,0.1503
+large-backward,float16,16384,131072,8,4.507835,5.997536,0.7516,0.3305
+large-backward,float16,8192,262144,8,3.849178,5.026853,0.7657,0.3060
+summary,preset,dtype,count,min_speedup,geomean_speedup,max_speedup
+summary,mid-backward,bfloat16,1,0.2273,0.2273,0.2273
+summary,mid-backward,float16,1,0.1937,0.1937,0.1937
+summary,large-backward,bfloat16,3,0.1787,0.2790,0.3409
+summary,large-backward,float16,3,0.1503,0.2596,0.3305

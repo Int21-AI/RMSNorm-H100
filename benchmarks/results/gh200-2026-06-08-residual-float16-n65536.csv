@@ -1,0 +1,4 @@
+M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup
+32768,65536,8,4.739010,5.144919,0.9211,0.0857
+summary,count,min_speedup,geomean_speedup,max_speedup
+summary,1,0.0857,0.0857,0.0857
