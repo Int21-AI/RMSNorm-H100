@@ -472,7 +472,9 @@ class RmsNormCudaTest(unittest.TestCase):
             (torch.bfloat16, 32768),
             (torch.float16, 65536),
             (torch.float32, 1024),
+            (torch.float32, 8192),
             (torch.float32, 16384),
+            (torch.float32, 32768),
         )
         for dtype, n in cases:
             with self.subTest(dtype=dtype, n=n):

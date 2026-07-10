@@ -2,9 +2,14 @@
 # SPDX-License-Identifier: MIT
 
 import argparse
+from contextlib import redirect_stdout
 import gc
+import importlib
+import json
 import math
 import os
+from pathlib import Path
+import subprocess
 import sys
 
 import torch
@@ -13,7 +18,7 @@ PACKAGE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 WORKSPACE_ROOT = os.path.dirname(PACKAGE_ROOT)
 QUACK_ROOT = os.environ.get("QUACK_ROOT", os.path.join(WORKSPACE_ROOT, "quack"))
 if os.path.isdir(QUACK_ROOT) and QUACK_ROOT not in sys.path:
-    sys.path.append(QUACK_ROOT)
+    sys.path.insert(0, QUACK_ROOT)
 
 
 MN_PAIRS = [
@@ -45,19 +50,19 @@ MN_PRESET_MODES = {
     "mid-backward": "backward",
 }
 MN_PRESET_DESCRIPTIONS = {
-    "large-backward": "large backward rows with maintained fp16 and bf16 speedup gates",
-    "mid-backward": "mid-sized backward row with maintained fp16 and bf16 speedup gates",
+    "large-backward": "large backward rows with maintained fp16 and bf16 1% ratio gates",
+    "mid-backward": "mid-sized backward row with maintained fp16 and bf16 1% ratio gates",
 }
 MN_PRESET_GATE_DTYPES = {
     "large-backward": ("bfloat16", "float16"),
     "mid-backward": ("bfloat16", "float16"),
 }
-MN_PRESET_MIN_SPEEDUPS = {
-    "large-backward": 0.08,
-    "mid-backward": 0.10,
+MN_PRESET_FAIL_RATIOS = {
+    "large-backward": 1.01,
+    "mid-backward": 1.01,
 }
 GATE_ALL = "all"
-GATE_CHOICES = tuple(sorted(MN_PRESETS)) + (GATE_ALL,)
+GATE_CHOICES = tuple(sorted(MN_PRESET_GATE_DTYPES)) + (GATE_ALL,)
 DEFAULT_INPUT_POOL_SIZE = 64
 DEFAULT_POOL_MEMORY_FRACTION = 0.80
 DEFAULT_PROVIDER_ORDER = "balanced"
@@ -71,16 +76,253 @@ DTYPES = {
 
 
 _BENCHMARK_OPS = None
+_QUACK_MODULE = None
+_QUACK_FWD_TUNER = None
+_QUACK_BWD_TUNER = None
+
+
+def configure_quack_root(root):
+    global QUACK_ROOT
+    if root is None:
+        return
+    root = os.path.abspath(os.path.expanduser(root))
+    if not os.path.isdir(root):
+        raise ValueError(f"QuACK root does not exist: {root}")
+    imported = sys.modules.get("quack")
+    if imported is not None:
+        imported_file = getattr(imported, "__file__", None)
+        if imported_file is not None and not os.path.abspath(imported_file).startswith(root + os.sep):
+            raise RuntimeError(
+                f"QuACK was already imported from {imported_file}; cannot switch to {root}"
+            )
+    if root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
+    QUACK_ROOT = root
+
+
+def configure_quack_autotune(mode):
+    if mode == "fresh":
+        os.environ["QUACK_FORCE_CACHE_UPDATE"] = "1"
+    elif mode == "cached":
+        os.environ.pop("QUACK_FORCE_CACHE_UPDATE", None)
+    else:
+        raise ValueError(f"unknown QuACK autotune mode: {mode}")
+
+
+def _require_quack_autotuner(name, tuner):
+    configs = getattr(tuner, "configs", None)
+    cache = getattr(tuner, "cache", None)
+    if configs is None or cache is None or len(configs) <= 1:
+        raise ImportError(
+            f"QuACK {name} is not an active multi-config autotuner. "
+            "Use a QuACK checkout that exports the exhaustive RMSNorm tuned APIs."
+        )
+
+
+def selected_quack_config(backward):
+    tuner = _QUACK_BWD_TUNER if backward else _QUACK_FWD_TUNER
+    if tuner is None:
+        raise RuntimeError("QuACK benchmark operations have not been initialized")
+    config = getattr(tuner, "best_config", None)
+    if config is None:
+        raise RuntimeError("QuACK autotuner did not expose a selected best_config")
+    return " ".join(str(config).replace(",", ";").split())
+
+
+def _git_state(path):
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return revision, dirty
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+
+
+def quack_provenance(autotune_mode):
+    benchmark_ops()
+    module_file = Path(_QUACK_MODULE.__file__).resolve()
+    checkout_root = module_file.parents[1]
+    revision, dirty = _git_state(checkout_root)
+    package = importlib.import_module("quack")
+    return {
+        "autotune_mode": autotune_mode,
+        "quack_version": getattr(package, "__version__", None),
+        "quack_module": str(module_file),
+        "quack_checkout": str(checkout_root),
+        "quack_revision": revision,
+        "quack_dirty": dirty,
+        "quack_fwd_config_count": len(_QUACK_FWD_TUNER.configs),
+        "quack_bwd_config_count": len(_QUACK_BWD_TUNER.configs),
+    }
+
+
+def emit_quack_provenance(args):
+    provenance = quack_provenance(args.quack_autotune)
+    print(
+        "quack_provenance=" + json.dumps(provenance, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
+    if args.quack_provenance_json is not None:
+        path = Path(args.quack_provenance_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
 
 
 def benchmark_ops():
-    global _BENCHMARK_OPS
+    global _BENCHMARK_OPS, _QUACK_MODULE, _QUACK_FWD_TUNER, _QUACK_BWD_TUNER
     if _BENCHMARK_OPS is None:
-        from quack.rmsnorm import rmsnorm_bwd as quack_bwd
-        from quack.rmsnorm import rmsnorm_fwd as quack_fwd
+        quack_rmsnorm = importlib.import_module("quack.rmsnorm")
+        quack_get_sm_count = getattr(
+            quack_rmsnorm, "get_sm_count", getattr(quack_rmsnorm, "_get_sm_count", None)
+        )
+        quack_fwd_tuned = getattr(quack_rmsnorm, "rmsnorm_fwd_tuned", None)
+        quack_bwd_tuned = getattr(quack_rmsnorm, "rmsnorm_bwd_tuned", None)
+        missing = [
+            name
+            for name, value in (
+                ("get_sm_count/_get_sm_count", quack_get_sm_count),
+                ("rmsnorm_fwd_tuned", quack_fwd_tuned),
+                ("rmsnorm_bwd_tuned", quack_bwd_tuned),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ImportError(
+                "QuACK RMSNorm autotuned benchmark APIs are missing: "
+                f"{', '.join(missing)}. Set QUACK_ROOT to a QuACK checkout "
+                "that exports autotuned RMSNorm entry points."
+            )
+        _require_quack_autotuner("rmsnorm_fwd_tuned", quack_fwd_tuned)
+        _require_quack_autotuner("rmsnorm_bwd_tuned", quack_bwd_tuned)
         from rmsnorm import rmsnorm_bwd, rmsnorm_fwd
         from triton.testing import do_bench
 
+        def quack_fwd(
+            x,
+            weight=None,
+            bias=None,
+            residual=None,
+            out_dtype=None,
+            residual_dtype=None,
+            eps=1e-6,
+            store_rstd=False,
+        ):
+            out_dtype = x.dtype if out_dtype is None else out_dtype
+            out = torch.empty_like(x, dtype=out_dtype)
+            rstd = (
+                torch.empty(*x.shape[:-1], device=x.device, dtype=torch.float32)
+                if store_rstd
+                else None
+            )
+            if residual is not None and residual_dtype is None:
+                residual_dtype = residual.dtype
+            if residual is not None or (
+                residual_dtype is not None and residual_dtype != x.dtype
+            ):
+                residual_out = torch.empty_like(
+                    x,
+                    dtype=residual_dtype if residual_dtype is not None else x.dtype,
+                )
+            else:
+                residual_out = None
+            per_head = (
+                (weight is not None and weight.dim() == 2)
+                or (bias is not None and bias.dim() == 2)
+            )
+            quack_fwd_tuned(
+                x,
+                weight,
+                out,
+                bias,
+                rstd,
+                None,
+                residual,
+                residual_out,
+                eps,
+                False,
+                per_head,
+            )
+            if residual_out is None:
+                residual_out = x
+            return out, residual_out, rstd
+
+        def quack_bwd(
+            x,
+            weight,
+            dout,
+            rstd,
+            dresidual_out=None,
+            has_bias=False,
+            has_residual=False,
+        ):
+            device = x.device
+            N = x.size(-1)
+            per_head = x.dim() == 3
+            dx = torch.empty_like(x)
+            if dresidual_out is not None and dresidual_out.dtype != dx.dtype:
+                dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
+            else:
+                dresidual = None
+            sm_count = quack_get_sm_count(N, device)
+            if per_head:
+                H = x.size(1)
+                sm_count = max(round(sm_count / H), 1)
+            else:
+                H = None
+            if weight is not None:
+                dw_shape = (sm_count, H, N) if per_head else (sm_count, N)
+                dw_partial = torch.empty(dw_shape, device=device, dtype=torch.float32)
+            else:
+                dw_partial = None
+            db_shape = (sm_count, H, N) if per_head else (sm_count, N)
+            db_partial = (
+                torch.empty(db_shape, device=device, dtype=torch.float32)
+                if has_bias
+                else None
+            )
+
+            if x.numel() > 0:
+                quack_bwd_tuned(
+                    x,
+                    weight,
+                    dout,
+                    rstd,
+                    dx,
+                    dw_partial,
+                    db_partial,
+                    dresidual_out,
+                    dresidual,
+                    sm_count,
+                    per_head,
+                    dw_partial is not None,
+                    db_partial is not None,
+                )
+                dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
+                db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+            else:
+                dw = torch.zeros_like(weight) if weight is not None else None
+                db = torch.zeros_like(weight) if has_bias else None
+            if has_residual and dresidual is None:
+                dresidual = dx
+            return dx, dw, db, dresidual
+
+        _QUACK_MODULE = quack_rmsnorm
+        _QUACK_FWD_TUNER = quack_fwd_tuned
+        _QUACK_BWD_TUNER = quack_bwd_tuned
         _BENCHMARK_OPS = rmsnorm_fwd, rmsnorm_bwd, quack_fwd, quack_bwd, do_bench
     return _BENCHMARK_OPS
 
@@ -115,8 +357,10 @@ def preset_listing_rows():
         (
             name,
             MN_PRESET_MODES[name],
-            "|".join(MN_PRESET_GATE_DTYPES[name]),
-            f"{MN_PRESET_MIN_SPEEDUPS[name]:.2f}",
+            "|".join(MN_PRESET_GATE_DTYPES.get(name, ())) or "none",
+            f"{MN_PRESET_FAIL_RATIOS[name]:.2f}"
+            if name in MN_PRESET_FAIL_RATIOS
+            else "none",
             format_preset_rows(MN_PRESETS[name]),
             MN_PRESET_DESCRIPTIONS[name],
         )
@@ -125,7 +369,7 @@ def preset_listing_rows():
 
 
 def format_preset_listing():
-    lines = ["preset,mode,gate_dtypes,min_speedup,rows,description"]
+    lines = ["preset,mode,gate_dtypes,fail_ratio,rows,description"]
     lines.extend(",".join(row) for row in preset_listing_rows())
     return "\n".join(lines)
 
@@ -133,6 +377,8 @@ def format_preset_listing():
 def preset_gate_config(preset):
     if preset not in MN_PRESETS:
         raise ValueError(f"unknown benchmark preset: {preset}")
+    if preset not in MN_PRESET_GATE_DTYPES:
+        raise ValueError(f"preset is not a benchmark gate: {preset}")
     mode = MN_PRESET_MODES[preset]
     return {
         "preset": preset,
@@ -142,14 +388,14 @@ def preset_gate_config(preset):
         "residual_out_dtype": "same",
         "dtype_names": MN_PRESET_GATE_DTYPES[preset],
         "mn_pairs": MN_PRESETS[preset],
-        "min_speedup": MN_PRESET_MIN_SPEEDUPS[preset],
+        "fail_ratio": MN_PRESET_FAIL_RATIOS[preset],
     }
 
 
 def gate_preset_names(gate):
     if gate == GATE_ALL:
-        return tuple(MN_PRESETS)
-    if gate not in MN_PRESETS:
+        return tuple(sorted(MN_PRESET_GATE_DTYPES))
+    if gate not in MN_PRESET_GATE_DTYPES:
         raise ValueError(f"unknown benchmark gate: {gate}")
     return (gate,)
 
@@ -264,7 +510,7 @@ def build_parser():
         choices=GATE_CHOICES,
         help=(
             "Run a maintained benchmark gate across its listed gate_dtypes and "
-            "min_speedup target; use 'all' to run every maintained gate"
+            "fail_ratio target; use 'all' to run every maintained gate"
         ),
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -291,6 +537,33 @@ def build_parser():
         help=(
             "Provider timing order. 'balanced' runs fresh pooled timings in "
             "both orders and averages each provider's time."
+        ),
+    )
+    parser.add_argument(
+        "--quack-root",
+        default=None,
+        help="QuACK checkout containing the exhaustive RMSNorm tuned APIs",
+    )
+    parser.add_argument(
+        "--quack-autotune",
+        choices=("fresh", "cached"),
+        default="fresh",
+        help=(
+            "Use 'fresh' to force QuACK to benchmark every valid config for each "
+            "compared item, or 'cached' to reuse its per-item autotune cache"
+        ),
+    )
+    parser.add_argument(
+        "--quack-provenance-json",
+        default=None,
+        help="Optional path for QuACK source and autotune provenance metadata",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Write benchmark CSV rows directly to this path. This keeps native "
+            "compiler diagnostics on the process stdout instead of corrupting CSV output."
         ),
     )
     parser.add_argument(
@@ -537,14 +810,73 @@ def bench_pair(
         quack_errors = [row[2] for row in timings]
         if any(error is not None for error in quack_errors):
             return timings[0]
+        quack_configs = {row[4] for row in timings}
+        if len(quack_configs) != 1:
+            raise RuntimeError(
+                "QuACK selected different autotune configs across provider orders: "
+                f"{sorted(quack_configs)}"
+            )
         return (
             mean([row[0] for row in timings]),
             mean([row[1] for row in timings]),
             None,
             min(row[3] for row in timings),
+            quack_configs.pop(),
         )
 
     rmsnorm_fwd, rmsnorm_bwd, quack_fwd, quack_bwd, do_bench = benchmark_ops()
+    if backward and residual:
+        raise ValueError("--residual is only supported for forward benchmarks")
+    residual_dtype = (
+        torch.float32
+        if not backward and residual_out_dtype == "float32"
+        else None
+    )
+    quack_unsupported = (
+        not backward and residual and dtype == torch.float32 and N >= 32768
+    )
+    quack_error = None
+    quack_config = None
+
+    # Autotune QuACK before allocating the large timing pool. Otherwise the
+    # pool can consume most VRAM and make valid QuACK configs fail with OOM.
+    torch.manual_seed(0)
+    tuning_pool = make_input_pool(
+        M,
+        N,
+        dtype,
+        backward,
+        residual,
+        residual_out_dtype,
+        1,
+        pool_memory_fraction,
+    )
+    tuning_entry = tuning_pool[0]
+    if backward:
+        quack_bwd(
+            tuning_entry["x"],
+            tuning_entry["w"],
+            tuning_entry["dout"],
+            tuning_entry["rstd"],
+        )
+        quack_config = selected_quack_config(backward=True)
+    elif not quack_unsupported:
+        try:
+            quack_fwd(
+                tuning_entry["x"],
+                tuning_entry["w"],
+                residual=tuning_entry.get("residual"),
+                residual_dtype=residual_dtype,
+            )
+            quack_config = selected_quack_config(backward=False)
+        except RuntimeError as exc:
+            message = str(exc).splitlines()[0]
+            quack_error = f"{exc.__class__.__name__}: {message}"
+    torch.cuda.synchronize()
+    del tuning_pool, tuning_entry
+    gc.collect()
+    torch.cuda.empty_cache()
+
     torch.manual_seed(0)
     pool = make_input_pool(
         M,
@@ -558,8 +890,6 @@ def bench_pair(
     )
     pool_size = len(pool)
     if backward:
-        if residual:
-            raise ValueError("--residual is only supported for forward benchmarks")
         first = pool[0]
         rmsnorm_bwd(first["x"], first["w"], first["dout"], first["rstd"])
         quack_bwd(first["x"], first["w"], first["dout"], first["rstd"])
@@ -582,29 +912,21 @@ def bench_pair(
         else:
             ours = do_bench(ours_call, warmup=warmup, rep=rep)
             quack = do_bench(quack_call, warmup=warmup, rep=rep)
-        quack_error = None
     else:
-        residual_dtype = torch.float32 if residual_out_dtype == "float32" else None
         first = pool[0]
-        quack_unsupported = residual and dtype == torch.float32 and N >= 32768
-        quack_error = None
         rmsnorm_fwd(
             first["x"],
             first["w"],
             residual=first.get("residual"),
             residual_dtype=residual_dtype,
         )
-        if not quack_unsupported:
-            try:
-                quack_fwd(
-                    first["x"],
-                    first["w"],
-                    residual=first.get("residual"),
-                    residual_dtype=residual_dtype,
-                )
-            except RuntimeError as exc:
-                message = str(exc).splitlines()[0]
-                quack_error = f"{exc.__class__.__name__}: {message}"
+        if not quack_unsupported and quack_error is None:
+            quack_fwd(
+                first["x"],
+                first["w"],
+                residual=first.get("residual"),
+                residual_dtype=residual_dtype,
+            )
         torch.cuda.synchronize()
         ours_call = rotating_pool_call(
             pool,
@@ -638,11 +960,20 @@ def bench_pair(
             else:
                 ours = do_bench(ours_call, warmup=warmup, rep=rep)
                 quack = do_bench(quack_call, warmup=warmup, rep=rep)
-    return ours, quack, quack_error, pool_size
+    return ours, quack, quack_error, pool_size, quack_config
 
 
 def print_benchmark_row(
-    M, N, pool_size, ours, quack, quack_error, results, dtype_name=None, preset_name=None
+    M,
+    N,
+    pool_size,
+    ours,
+    quack,
+    quack_error,
+    quack_config,
+    results,
+    dtype_name=None,
+    preset_name=None,
 ):
     prefix_parts = []
     if preset_name is not None:
@@ -654,12 +985,16 @@ def print_benchmark_row(
         prefix = f"{prefix},"
     if quack_error is not None:
         results.append((M, N, None))
-        print(f"{prefix}{M},{N},{pool_size},{ours:.6f},{quack_error},nan,nan", flush=True)
+        print(
+            f"{prefix}{M},{N},{pool_size},{ours:.6f},{quack_error},nan,nan,",
+            flush=True,
+        )
         return
     ratio = ours / quack
     results.append((M, N, ratio))
     print(
-        f"{prefix}{M},{N},{pool_size},{ours:.6f},{quack:.6f},{ratio:.4f},{format_speedup(ratio)}",
+        f"{prefix}{M},{N},{pool_size},{ours:.6f},{quack:.6f},{ratio:.4f},"
+        f"{format_speedup(ratio)},{quack_config}",
         flush=True,
     )
 
@@ -670,7 +1005,7 @@ def run_rows(mn_pairs, dtype, args, dtype_name=None, preset_name=None):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        ours, quack, quack_error, pool_size = bench_pair(
+        ours, quack, quack_error, pool_size, quack_config = bench_pair(
             M,
             N,
             dtype,
@@ -690,6 +1025,7 @@ def run_rows(mn_pairs, dtype, args, dtype_name=None, preset_name=None):
             ours,
             quack,
             quack_error,
+            quack_config,
             results,
             dtype_name=dtype_name,
             preset_name=preset_name,
@@ -701,7 +1037,9 @@ def run_rows(mn_pairs, dtype, args, dtype_name=None, preset_name=None):
 
 
 def run_gate(args):
-    print("preset,dtype,M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup")
+    print(
+        "preset,dtype,M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup,quack_config"
+    )
     summaries = []
     threshold_errors = []
     for preset_name in gate_preset_names(args.gate):
@@ -727,7 +1065,7 @@ def run_gate(args):
             )
             summaries.append((preset_name, dtype_name, speedup_summary(results)))
             try:
-                threshold_failures(results, min_speedup=config["min_speedup"])
+                threshold_failures(results, fail_ratio=config["fail_ratio"])
             except ValueError as exc:
                 threshold_errors.append(f"{preset_name}/{dtype_name}: {exc}")
     if args.summary:
@@ -746,14 +1084,12 @@ def run_gate(args):
         raise ValueError("; ".join(threshold_errors))
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.list_presets:
-        print(format_preset_listing())
-        return
+def run_benchmark(args, parser):
     try:
         validate_args(args)
+        configure_quack_root(args.quack_root)
+        configure_quack_autotune(args.quack_autotune)
+        emit_quack_provenance(args)
         if args.gate:
             run_gate(args)
             return
@@ -762,7 +1098,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    print("M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup")
+    print("M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup,quack_config")
     results = run_rows(mn_pairs, dtype, args)
     if args.summary:
         print("summary,count,min_speedup,geomean_speedup,max_speedup")
@@ -771,6 +1107,22 @@ def main():
         threshold_failures(results, args.fail_ratio, args.min_speedup)
     except ValueError as exc:
         parser.exit(1, f"{exc}\n")
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.list_presets:
+        print(format_preset_listing())
+        return
+    if args.output is None:
+        run_benchmark(args, parser)
+        return
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as output:
+        with redirect_stdout(output):
+            run_benchmark(args, parser)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cooperative_groups.h>
@@ -47,6 +48,24 @@ constexpr int kResidualClusterBf16WeightPrefetchVecs = 6;
                                cudaGetErrorString(status__));                   \
     }                                                                           \
   } while (0)
+
+void driver_check(CUresult status, char const* expression, char const* file,
+                  int line) {
+  if (status == CUDA_SUCCESS) {
+    return;
+  }
+  char const* name = nullptr;
+  char const* description = nullptr;
+  cuGetErrorName(status, &name);
+  cuGetErrorString(status, &description);
+  throw std::runtime_error(
+      std::string("CUDA driver error at ") + file + ":" +
+      std::to_string(line) + ": " + expression + ": " +
+      (name == nullptr ? "unknown" : name) + " (" +
+      (description == nullptr ? "no description" : description) + ")");
+}
+
+#define CU_CHECK(expr) driver_check((expr), #expr, __FILE__, __LINE__)
 
 enum class DType { kF16, kBF16, kF32 };
 enum class Mode { kForward, kBackward, kBoth };
@@ -281,8 +300,10 @@ int bwd_partial_blocks(int N, int M, int requested = 0) {
   int multiple =
       N <= 256 ? 8
                : (N <= 1024 ? 8 : (N <= 2048 ? 4 : (N <= 4096 ? 2 : 1)));
+  // The 16K backward row is reduce-bound with one partial per SM; half as many
+  // persistent CTAs cuts dw reduction work without starving the row kernel.
   int blocks = N <= 8192 ? sm_count * multiple
-                         : (N <= 16384 ? sm_count : sm_count * 2);
+                         : (N <= 16384 ? sm_count / 2 : sm_count * 2);
   return std::max(1, std::min(M, blocks));
 }
 
@@ -416,6 +437,16 @@ struct Vec128 {
 
   __device__ __forceinline__ void store(T* ptr) const {
     asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(ptr),
+                 "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w));
+  }
+
+  __device__ __forceinline__ void store_cg(T* ptr) const {
+    asm volatile("st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(ptr),
+                 "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w));
+  }
+
+  __device__ __forceinline__ void store_cs(T* ptr) const {
+    asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(ptr),
                  "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w));
   }
 
@@ -553,6 +584,30 @@ __device__ __forceinline__ uint32_t pack_f16x2(float lo, float hi) {
   } cvt;
   cvt.v = __floats2half2_rn(lo, hi);
   return cvt.u;
+}
+
+__device__ __forceinline__ uint32_t uint4_word(uint4 bits, int index) {
+  return index == 0 ? bits.x
+                    : (index == 1 ? bits.y : (index == 2 ? bits.z : bits.w));
+}
+
+template <typename X>
+__device__ __forceinline__ float2 packed_pair_to_float2(uint32_t bits) {
+  if constexpr (std::is_same_v<X, __half>) {
+    union {
+      uint32_t u;
+      __half2 v;
+    } cvt;
+    cvt.u = bits;
+    return __half22float2(cvt.v);
+  } else {
+    union {
+      uint32_t u;
+      __nv_bfloat162 v;
+    } cvt;
+    cvt.u = bits;
+    return __bfloat1622float2(cvt.v);
+  }
 }
 
 template <typename T, int kLanes>
@@ -875,6 +930,18 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* barrier,
                : "memory");
 }
 
+__device__ __forceinline__ uint64_t
+mbarrier_arrive_expect_tx_state(uint64_t* barrier, uint32_t bytes) {
+  uint32_t addr = smem_ptr_to_uint(barrier);
+  uint64_t state = 0;
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+      : "=l"(state)
+      : "r"(addr), "r"(bytes)
+      : "memory");
+  return state;
+}
+
 __device__ __forceinline__ void mbarrier_arrive_remote(uint64_t* barrier,
                                                         uint32_t cta_rank) {
   uint32_t addr = smem_ptr_to_uint(barrier);
@@ -902,8 +969,39 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, int phase) {
       : "memory");
 }
 
+__device__ __forceinline__ void mbarrier_wait_state(uint64_t* barrier,
+                                                    uint64_t state) {
+  uint32_t addr = smem_ptr_to_uint(barrier);
+  asm volatile(
+      "{ .reg .pred p; "
+      "wait_loop%=: "
+      "mbarrier.test_wait.acquire.cta.shared::cta.b64 p, [%0], %1; "
+      "@p bra wait_done%=; "
+      "nanosleep.u32 8; "
+      "bra wait_loop%=; "
+      "wait_done%=: }"
+      :
+      : "r"(addr), "l"(state)
+      : "memory");
+}
+
 __device__ __forceinline__ void fence_view_async_shared() {
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+__device__ __forceinline__ void tma_load_3d(void* smem_ptr,
+                                            CUtensorMap const* tensor_map,
+                                            uint64_t* barrier, int c0, int c1,
+                                            int c2) {
+  uint32_t smem_addr = smem_ptr_to_uint(smem_ptr);
+  uint32_t barrier_addr = smem_ptr_to_uint(barrier);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cta.global.tile."
+      "mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+      :
+      : "r"(smem_addr), "l"(tensor_map), "r"(c0), "r"(c1), "r"(c2),
+        "r"(barrier_addr)
+      : "memory");
 }
 
 __device__ __forceinline__ void store_shared_remote_float(
@@ -921,9 +1019,9 @@ __device__ __forceinline__ void store_shared_remote_float(
       : "memory");
 }
 
-__device__ float cluster_reduce_sum_mbar(float value, float* reduce_buf,
-                                         uint64_t* full_barrier, int stage,
-                                         int phase, int parts) {
+__device__ __forceinline__ float cluster_reduce_sum_mbar(
+    float value, float* reduce_buf, uint64_t* full_barrier, int stage,
+    int phase, int parts) {
   int tid = threadIdx.x;
   int lane_id = tid & 31;
   int warp_id = tid >> 5;
@@ -1216,7 +1314,11 @@ __global__ __launch_bounds__(kThreads, 2) void rmsnorm_fwd_weight_cpasync_full_k
       out_values[lane] = xv * rstd * wv;
     }
     set_vec_from_float_lanes(out_vec, out_values);
-    out_vec.store(out + row_base + elem);
+    if constexpr (std::is_same_v<X, float> && kVecs == 4) {
+      out_vec.store_cs(out + row_base + elem);
+    } else {
+      out_vec.store(out + row_base + elem);
+    }
   }
 }
 
@@ -1332,10 +1434,20 @@ __global__ void rmsnorm_fwd_weight_multirow_full_kernel(
   for (int iter = 0; iter < kVecs; ++iter) {
     int elem = (iter * kThreadsPerRow + row_tid) * kLanes;
     x_vec[iter].load(x + row_base + elem);
+    if constexpr (sizeof(X) < 4) {
 #pragma unroll
-    for (int lane = 0; lane < kLanes; ++lane) {
-      float xv = x_vec[iter].get(lane);
-      sq = fmaf(xv, xv, sq);
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        sq = fmaf(x_pair.x, x_pair.x, sq);
+        sq = fmaf(x_pair.y, x_pair.y, sq);
+      }
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane);
+        sq = fmaf(xv, xv, sq);
+      }
     }
   }
 
@@ -1353,16 +1465,114 @@ __global__ void rmsnorm_fwd_weight_multirow_full_kernel(
       weight_vec1.load(weight + affine_base + elem + 4);
     }
     float out_values[kLanes];
+    if constexpr (sizeof(X) < 4) {
 #pragma unroll
-    for (int lane = 0; lane < kLanes; ++lane) {
-      float xv = x_vec[iter].get(lane);
-      float wv;
-      if constexpr (kLanes > 4) {
-        wv = lane < 4 ? weight_vec0.get(lane) : weight_vec1.get(lane - 4);
-      } else {
-        wv = weight_vec0.get(lane);
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        int lane = pair * 2;
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        float w0 = lane < 4 ? weight_vec0.get(lane)
+                            : weight_vec1.get(lane - 4);
+        float w1 = (lane + 1) < 4 ? weight_vec0.get(lane + 1)
+                                  : weight_vec1.get(lane - 3);
+        out_values[lane] = x_pair.x * rstd * w0;
+        out_values[lane + 1] = x_pair.y * rstd * w1;
       }
-      out_values[lane] = xv * rstd * wv;
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane);
+        float wv = weight_vec0.get(lane);
+        out_values[lane] = xv * rstd * wv;
+      }
+    }
+    set_vec_from_float_lanes(out_vec, out_values);
+    out_vec.store(out + row_base + elem);
+  }
+}
+
+template <typename X, int kVecs, int kThreadsPerRow,
+          bool kAssumeH1 = false>
+__global__ void rmsnorm_fwd_weight_multirow_tpr_full_kernel(
+    X* __restrict__ out, X const* __restrict__ x,
+    float const* __restrict__ weight, int M, int N, int H, float eps) {
+  __shared__ float smem_acc[32];
+  using XVec = Vec128<X>;
+  constexpr int kLanes = XVec::kLanes;
+
+  int tid = threadIdx.x;
+  int row_group = tid / kThreadsPerRow;
+  int row_tid = tid - row_group * kThreadsPerRow;
+  int rows_per_cta = blockDim.x / kThreadsPerRow;
+  int row = blockIdx.x * rows_per_cta + row_group;
+  if (row >= M) {
+    return;
+  }
+  int row_base = row * N;
+  int affine_base = 0;
+  if constexpr (!kAssumeH1) {
+    int head = H > 1 ? row % H : 0;
+    affine_base = head * N;
+  }
+
+  XVec x_vec[kVecs];
+  float sq = 0.0f;
+
+#pragma unroll
+  for (int iter = 0; iter < kVecs; ++iter) {
+    int elem = (iter * kThreadsPerRow + row_tid) * kLanes;
+    x_vec[iter].load(x + row_base + elem);
+    if constexpr (sizeof(X) < 4) {
+#pragma unroll
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        sq = fmaf(x_pair.x, x_pair.x, sq);
+        sq = fmaf(x_pair.y, x_pair.y, sq);
+      }
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane);
+        sq = fmaf(xv, xv, sq);
+      }
+    }
+  }
+
+  float sq_sum = row_group_reduce_sum(sq, smem_acc, kThreadsPerRow);
+  float rstd = ptx_rsqrt(sq_sum / static_cast<float>(N) + eps);
+
+#pragma unroll
+  for (int iter = 0; iter < kVecs; ++iter) {
+    int elem = (iter * kThreadsPerRow + row_tid) * kLanes;
+    Vec128<float> weight_vec0;
+    Vec128<float> weight_vec1;
+    XVec out_vec;
+    weight_vec0.load(weight + affine_base + elem);
+    if constexpr (kLanes > 4) {
+      weight_vec1.load(weight + affine_base + elem + 4);
+    }
+    float out_values[kLanes];
+    if constexpr (sizeof(X) < 4) {
+#pragma unroll
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        int lane = pair * 2;
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        float w0 = lane < 4 ? weight_vec0.get(lane)
+                            : weight_vec1.get(lane - 4);
+        float w1 = (lane + 1) < 4 ? weight_vec0.get(lane + 1)
+                                  : weight_vec1.get(lane - 3);
+        out_values[lane] = x_pair.x * rstd * w0;
+        out_values[lane + 1] = x_pair.y * rstd * w1;
+      }
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane);
+        float wv = weight_vec0.get(lane);
+        out_values[lane] = xv * rstd * wv;
+      }
     }
     set_vec_from_float_lanes(out_vec, out_values);
     out_vec.store(out + row_base + elem);
@@ -1404,8 +1614,14 @@ __global__ void rmsnorm_fwd_residual_multirow_full_kernel(
 #pragma unroll
   for (int iter = 0; iter < kVecs; ++iter) {
     int elem = (iter * kThreadsPerRow + row_tid) * kLanes;
-    x_vec[iter].load(x + row_base + elem);
-    residual_vec[iter].load(residual + row_base + elem);
+    if constexpr (std::is_same_v<X, __half> && std::is_same_v<X, RO> &&
+                  kVecs == 4 && kThreadsPerRow == 512) {
+      x_vec[iter].load_cg(x + row_base + elem);
+      residual_vec[iter].load_cg(residual + row_base + elem);
+    } else {
+      x_vec[iter].load(x + row_base + elem);
+      residual_vec[iter].load(residual + row_base + elem);
+    }
     if constexpr (kPreloadWeight) {
       pre_weight_vec0[iter].load(weight + affine_base + elem);
       if constexpr (kLanes > 4) {
@@ -1413,13 +1629,32 @@ __global__ void rmsnorm_fwd_residual_multirow_full_kernel(
       }
     }
     float residual_values[kLanes];
+    if constexpr (sizeof(X) < 4) {
 #pragma unroll
-    for (int lane = 0; lane < kLanes; ++lane) {
-      float xv = x_vec[iter].get(lane) + residual_vec[iter].get(lane);
-      if constexpr (kEarlyMixedResidualStore && !std::is_same_v<X, RO>) {
-        residual_values[lane] = xv;
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        int lane = pair * 2;
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        float2 residual_pair =
+            packed_pair_to_float2<X>(uint4_word(residual_vec[iter].bits, pair));
+        float xv0 = x_pair.x + residual_pair.x;
+        float xv1 = x_pair.y + residual_pair.y;
+        if constexpr (kEarlyMixedResidualStore && !std::is_same_v<X, RO>) {
+          residual_values[lane] = xv0;
+          residual_values[lane + 1] = xv1;
+        }
+        sq = fmaf(xv0, xv0, sq);
+        sq = fmaf(xv1, xv1, sq);
       }
-      sq = fmaf(xv, xv, sq);
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane) + residual_vec[iter].get(lane);
+        if constexpr (kEarlyMixedResidualStore && !std::is_same_v<X, RO>) {
+          residual_values[lane] = xv;
+        }
+        sq = fmaf(xv, xv, sq);
+      }
     }
     if constexpr (kEarlyMixedResidualStore && !std::is_same_v<X, RO>) {
       store_residual_lanes<RO, kLanes>(residual_out + row_base + elem,
@@ -1449,26 +1684,49 @@ __global__ void rmsnorm_fwd_residual_multirow_full_kernel(
         weight_vec1.load(weight + affine_base + elem + 4);
       }
     }
+    if constexpr (sizeof(X) < 4) {
 #pragma unroll
-    for (int lane = 0; lane < kLanes; ++lane) {
-      float xv = x_vec[iter].get(lane) + residual_vec[iter].get(lane);
-      float wv;
-      if constexpr (kLanes > 4) {
-        wv = lane < 4 ? weight_vec0.get(lane) : weight_vec1.get(lane - 4);
-      } else {
-        wv = weight_vec0.get(lane);
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        int lane = pair * 2;
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        float2 residual_pair =
+            packed_pair_to_float2<X>(uint4_word(residual_vec[iter].bits, pair));
+        float xv0 = x_pair.x + residual_pair.x;
+        float xv1 = x_pair.y + residual_pair.y;
+        float w0 = lane < 4 ? weight_vec0.get(lane)
+                            : weight_vec1.get(lane - 4);
+        float w1 = (lane + 1) < 4 ? weight_vec0.get(lane + 1)
+                                  : weight_vec1.get(lane - 3);
+        if constexpr (std::is_same_v<X, RO> || !kEarlyMixedResidualStore) {
+          residual_values[lane] = xv0;
+          residual_values[lane + 1] = xv1;
+        }
+        out_values[lane] = xv0 * rstd * w0;
+        out_values[lane + 1] = xv1 * rstd * w1;
       }
-      if constexpr (std::is_same_v<X, RO> || !kEarlyMixedResidualStore) {
-        residual_values[lane] = xv;
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane) + residual_vec[iter].get(lane);
+        float wv;
+        if constexpr (kLanes > 4) {
+          wv = lane < 4 ? weight_vec0.get(lane) : weight_vec1.get(lane - 4);
+        } else {
+          wv = weight_vec0.get(lane);
+        }
+        if constexpr (std::is_same_v<X, RO> || !kEarlyMixedResidualStore) {
+          residual_values[lane] = xv;
+        }
+        out_values[lane] = xv * rstd * wv;
       }
-      out_values[lane] = xv * rstd * wv;
     }
     set_vec_from_float_lanes(out_vec, out_values);
     if constexpr (std::is_same_v<X, RO>) {
       XVec residual_out_vec;
       set_vec_from_float_lanes(residual_out_vec, residual_values);
-      residual_out_vec.store(residual_out + row_base + elem);
       out_vec.store(out + row_base + elem);
+      residual_out_vec.store(residual_out + row_base + elem);
     } else if constexpr (!kEarlyMixedResidualStore) {
       out_vec.store(out + row_base + elem);
       store_residual_lanes<RO, kLanes>(residual_out + row_base + elem,
@@ -1985,7 +2243,11 @@ __global__ void rmsnorm_fwd_cluster_reg_full_kernel(
   for (int iter = 0; iter < kVecs; ++iter) {
     int local_vec = iter * blockDim.x + tid;
     int elem = (begin_vec + local_vec) * kLanes;
-    x_vec[iter].load(x + row_base + elem);
+    if constexpr (std::is_same_v<X, float> && kVecs == 4) {
+      x_vec[iter].load_cg(x + row_base + elem);
+    } else {
+      x_vec[iter].load(x + row_base + elem);
+    }
     sq = accumulate_sq_vec(x_vec[iter], sq);
   }
 
@@ -2050,23 +2312,42 @@ __global__ void rmsnorm_fwd_cluster_reg_full_kernel(
         weight_vec1 = weight_pref1[iter];
       }
     } else {
-      weight_vec0.load(weight + affine_base + elem);
+      if constexpr (std::is_same_v<X, float> && kVecs == 4) {
+        weight_vec0.load_cg(weight + affine_base + elem);
+      } else {
+        weight_vec0.load(weight + affine_base + elem);
+      }
       if constexpr (kLanes > 4) {
         weight_vec1.load(weight + affine_base + elem + 4);
       }
     }
     XVec out_vec;
     float out_values[kLanes];
+    if constexpr (sizeof(X) < 4) {
 #pragma unroll
-    for (int lane = 0; lane < kLanes; ++lane) {
-      float xv = x_vec[iter].get(lane);
-      float wv;
-      if constexpr (kLanes > 4) {
-        wv = lane < 4 ? weight_vec0.get(lane) : weight_vec1.get(lane - 4);
-      } else {
-        wv = weight_vec0.get(lane);
+      for (int pair = 0; pair < kLanes / 2; ++pair) {
+        int lane = pair * 2;
+        float2 x_pair =
+            packed_pair_to_float2<X>(uint4_word(x_vec[iter].bits, pair));
+        float w0 = lane < 4 ? weight_vec0.get(lane)
+                            : weight_vec1.get(lane - 4);
+        float w1 = (lane + 1) < 4 ? weight_vec0.get(lane + 1)
+                                  : weight_vec1.get(lane - 3);
+        out_values[lane] = x_pair.x * rstd * w0;
+        out_values[lane + 1] = x_pair.y * rstd * w1;
       }
-      out_values[lane] = xv * rstd * wv;
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float xv = x_vec[iter].get(lane);
+        float wv;
+        if constexpr (kLanes > 4) {
+          wv = lane < 4 ? weight_vec0.get(lane) : weight_vec1.get(lane - 4);
+        } else {
+          wv = weight_vec0.get(lane);
+        }
+        out_values[lane] = xv * rstd * wv;
+      }
     }
     set_vec_from_float_lanes(out_vec, out_values);
     out_vec.store(out + row_base + elem);
@@ -3494,6 +3775,530 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
   for (int iter = 0; iter < kMaxVecs; ++iter) {
     int vec_local = iter * blockDim.x + tid;
     if (kExact || vec_local < part_vecs) {
+	      int elem = begin_elem + vec_local * kLanes;
+	      Vec128<float> w0;
+	      Vec128<float> w1;
+	      w0.load(weight + elem);
+	      if constexpr (kLanes > 4) {
+	        w1.load(weight + elem + 4);
+	      }
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        if constexpr (kLanes > 4) {
+          weight_reg[iter][lane] =
+              lane < 4 ? w0.get(lane) : w1.get(lane - 4);
+        } else {
+          weight_reg[iter][lane] = w0.get(lane);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        weight_reg[iter][lane] = 0.0f;
+      }
+    }
+#pragma unroll
+    for (int lane = 0; lane < kLanes; ++lane) {
+      dw_acc[iter][lane] = 0.0f;
+    }
+  }
+
+  int row0 = blockIdx.x;
+#pragma unroll
+  for (int iter = 0; iter < kMaxVecs; ++iter) {
+    int vec_local = iter * blockDim.x + tid;
+	    if (row0 < M && (kExact || vec_local < part_vecs)) {
+	      int elem_local = vec_local * kLanes;
+	      int elem = begin_elem + elem_local;
+	      cp_async_128(smem_x + elem_local, x + row0 * N + elem);
+	      cp_async_128(smem_dout + elem_local, dout + row0 * N + elem);
+	    }
+	  }
+  cp_async_commit_group();
+
+  int stage = 0;
+  int consumer_phase = 0;
+  int producer_phase = 1;
+  for (int row = row0; row < M; row += gridDim.x) {
+    int next_row = row + gridDim.x;
+    float rstd = rstd_in[row];
+    if (next_row < M) {
+      X* next_x = smem_x + (stage ^ 1) * elems_per_part;
+      X* next_dout = smem_dout + (stage ^ 1) * elems_per_part;
+#pragma unroll
+      for (int iter = 0; iter < kMaxVecs; ++iter) {
+        int vec_local = iter * blockDim.x + tid;
+	        if (kExact || vec_local < part_vecs) {
+	          int elem_local = vec_local * kLanes;
+	          int elem = begin_elem + elem_local;
+	          cp_async_128(next_x + elem_local, x + next_row * N + elem);
+	          cp_async_128(next_dout + elem_local, dout + next_row * N + elem);
+	        }
+	      }
+      cp_async_commit_group();
+      cp_async_wait_group_1();
+    } else {
+      cp_async_wait_group_0();
+    }
+
+    X* cur_x = smem_x + stage * elems_per_part;
+    X* cur_dout = smem_dout + stage * elems_per_part;
+    float dot = 0.0f;
+    float xhat_reg[kMaxVecs][kLanes];
+
+    if constexpr (kReloadDout) {
+#pragma unroll
+      for (int iter = 0; iter < kMaxVecs; ++iter) {
+        int vec_local = iter * blockDim.x + tid;
+        if (kExact || vec_local < part_vecs) {
+          int elem_local = vec_local * kLanes;
+          XVec x_vec;
+          XVec dout_vec;
+          x_vec.load_shared(cur_x + elem_local);
+          dout_vec.load_shared(cur_dout + elem_local);
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            float x_hat = x_vec.get(lane) * rstd;
+            float wdy = dout_vec.get(lane) * weight_reg[iter][lane];
+            xhat_reg[iter][lane] = x_hat;
+            dot = fmaf(x_hat, wdy, dot);
+          }
+        } else {
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            xhat_reg[iter][lane] = 0.0f;
+          }
+        }
+      }
+	    } else {
+	      float dout_reg[kMaxVecs][kLanes];
+	      float wdy_reg[kMaxVecs][kLanes];
+	#pragma unroll
+	      for (int iter = 0; iter < kMaxVecs; ++iter) {
+	        int vec_local = iter * blockDim.x + tid;
+	        if (kExact || vec_local < part_vecs) {
+          int elem_local = vec_local * kLanes;
+          XVec x_vec;
+          XVec dout_vec;
+          x_vec.load_shared(cur_x + elem_local);
+          dout_vec.load_shared(cur_dout + elem_local);
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            float dy_f = dout_vec.get(lane);
+            float x_hat = x_vec.get(lane) * rstd;
+	            float wdy = dy_f * weight_reg[iter][lane];
+	            xhat_reg[iter][lane] = x_hat;
+	            dout_reg[iter][lane] = dy_f;
+	            wdy_reg[iter][lane] = wdy;
+	            dot = fmaf(x_hat, wdy, dot);
+	          }
+	        } else {
+	#pragma unroll
+	          for (int lane = 0; lane < kLanes; ++lane) {
+	            xhat_reg[iter][lane] = 0.0f;
+	            dout_reg[iter][lane] = 0.0f;
+	            wdy_reg[iter][lane] = 0.0f;
+	          }
+	        }
+	      }
+
+      mbarrier_wait(smem_mbar + 2 + stage, producer_phase);
+      float mean_xhat_wdy =
+          cluster_reduce_sum_mbar(dot, smem_reduce, smem_mbar, stage,
+                                  consumer_phase, parts) /
+          static_cast<float>(N);
+      if ((tid & 31) < parts) {
+        mbarrier_arrive_remote(smem_mbar + 2 + stage,
+                               static_cast<uint32_t>(tid & 31));
+      }
+
+#pragma unroll
+      for (int iter = 0; iter < kMaxVecs; ++iter) {
+        int vec_local = iter * blockDim.x + tid;
+        if (kExact || vec_local < part_vecs) {
+          int elem_local = vec_local * kLanes;
+          int elem = begin_elem + elem_local;
+          XVec dx_vec;
+          dx_vec.bits = make_uint4(0, 0, 0, 0);
+          if constexpr (std::is_same_v<X, __nv_bfloat16>) {
+#pragma unroll
+            for (int lane = 0; lane < kLanes; lane += 2) {
+	            float x_hat0 = xhat_reg[iter][lane];
+	            float dy_f0 = dout_reg[iter][lane];
+	            float wdy0 = wdy_reg[iter][lane];
+	            float grad0 = (wdy0 - x_hat0 * mean_xhat_wdy) * rstd;
+	            float x_hat1 = xhat_reg[iter][lane + 1];
+	            float dy_f1 = dout_reg[iter][lane + 1];
+	            float wdy1 = wdy_reg[iter][lane + 1];
+	            float grad1 = (wdy1 - x_hat1 * mean_xhat_wdy) * rstd;
+	            uint32_t packed = pack_bf16x2(grad0, grad1);
+              if (lane == 0) {
+                dx_vec.bits.x = packed;
+              } else if (lane == 2) {
+                dx_vec.bits.y = packed;
+              } else if (lane == 4) {
+                dx_vec.bits.z = packed;
+              } else {
+                dx_vec.bits.w = packed;
+              }
+              dw_acc[iter][lane] += dy_f0 * x_hat0;
+              dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+            }
+          } else if constexpr (std::is_same_v<X, __half>) {
+#pragma unroll
+            for (int lane = 0; lane < kLanes; lane += 2) {
+	            float x_hat0 = xhat_reg[iter][lane];
+	            float dy_f0 = dout_reg[iter][lane];
+	            float wdy0 = wdy_reg[iter][lane];
+	            float grad0 = (wdy0 - x_hat0 * mean_xhat_wdy) * rstd;
+	            float x_hat1 = xhat_reg[iter][lane + 1];
+	            float dy_f1 = dout_reg[iter][lane + 1];
+	            float wdy1 = wdy_reg[iter][lane + 1];
+	            float grad1 = (wdy1 - x_hat1 * mean_xhat_wdy) * rstd;
+	            uint32_t packed = pack_f16x2(grad0, grad1);
+              if (lane == 0) {
+                dx_vec.bits.x = packed;
+              } else if (lane == 2) {
+                dx_vec.bits.y = packed;
+              } else if (lane == 4) {
+                dx_vec.bits.z = packed;
+              } else {
+                dx_vec.bits.w = packed;
+              }
+              dw_acc[iter][lane] += dy_f0 * x_hat0;
+              dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+            }
+          } else {
+#pragma unroll
+            for (int lane = 0; lane < kLanes; ++lane) {
+	            float x_hat = xhat_reg[iter][lane];
+	            float dy_f = dout_reg[iter][lane];
+	            float wdy = wdy_reg[iter][lane];
+	            float grad = (wdy - x_hat * mean_xhat_wdy) * rstd;
+              dx_vec.set(lane, grad);
+              dw_acc[iter][lane] += dy_f * x_hat;
+            }
+          }
+          if constexpr (std::is_same_v<X, __nv_bfloat16>) {
+            dx_vec.store_cs(dx + row * N + elem);
+          } else {
+            dx_vec.store(dx + row * N + elem);
+          }
+        }
+      }
+      stage ^= 1;
+      if (stage == 0) {
+        consumer_phase ^= 1;
+        producer_phase ^= 1;
+      }
+      continue;
+    }
+
+    mbarrier_wait(smem_mbar + 2 + stage, producer_phase);
+    float mean_xhat_wdy =
+        cluster_reduce_sum_mbar(dot, smem_reduce, smem_mbar, stage,
+                                consumer_phase, parts) /
+        static_cast<float>(N);
+    if ((tid & 31) < parts) {
+      mbarrier_arrive_remote(smem_mbar + 2 + stage,
+                             static_cast<uint32_t>(tid & 31));
+    }
+
+#pragma unroll
+    for (int iter = 0; iter < kMaxVecs; ++iter) {
+      int vec_local = iter * blockDim.x + tid;
+      if (kExact || vec_local < part_vecs) {
+        int elem_local = vec_local * kLanes;
+        int elem = begin_elem + elem_local;
+        XVec dout_vec;
+        XVec dx_vec;
+        dout_vec.load_shared(cur_dout + elem_local);
+        dx_vec.bits = make_uint4(0, 0, 0, 0);
+        if constexpr (std::is_same_v<X, __half>) {
+#pragma unroll
+          for (int lane = 0; lane < kLanes; lane += 2) {
+            float x_hat0 = xhat_reg[iter][lane];
+            float dy_f0 = dout_vec.get(lane);
+            float wdy0 = dy_f0 * weight_reg[iter][lane];
+            float grad0 = (wdy0 - x_hat0 * mean_xhat_wdy) * rstd;
+            float x_hat1 = xhat_reg[iter][lane + 1];
+            float dy_f1 = dout_vec.get(lane + 1);
+            float wdy1 = dy_f1 * weight_reg[iter][lane + 1];
+            float grad1 = (wdy1 - x_hat1 * mean_xhat_wdy) * rstd;
+            uint32_t packed = pack_f16x2(grad0, grad1);
+            if (lane == 0) {
+              dx_vec.bits.x = packed;
+            } else if (lane == 2) {
+              dx_vec.bits.y = packed;
+            } else if (lane == 4) {
+              dx_vec.bits.z = packed;
+            } else {
+              dx_vec.bits.w = packed;
+            }
+            dw_acc[iter][lane] += dy_f0 * x_hat0;
+            dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+          }
+        } else {
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            float x_hat = xhat_reg[iter][lane];
+            float dy_f = dout_vec.get(lane);
+            float wdy = dy_f * weight_reg[iter][lane];
+            float grad = (wdy - x_hat * mean_xhat_wdy) * rstd;
+            dx_vec.set(lane, grad);
+            dw_acc[iter][lane] += dy_f * x_hat;
+          }
+        }
+        if constexpr (std::is_same_v<X, __nv_bfloat16>) {
+          dx_vec.store_cs(dx + row * N + elem);
+        } else {
+          dx_vec.store(dx + row * N + elem);
+        }
+      }
+    }
+    stage ^= 1;
+    if (stage == 0) {
+      consumer_phase ^= 1;
+      producer_phase ^= 1;
+    }
+  }
+
+  stage ^= 1;
+  if (stage == 0) {
+    producer_phase ^= 1;
+  }
+  mbarrier_wait(smem_mbar + 2 + stage, producer_phase);
+
+#pragma unroll
+  for (int iter = 0; iter < kMaxVecs; ++iter) {
+    int vec_local = iter * blockDim.x + tid;
+    if (kExact || vec_local < part_vecs) {
+      int elem_local = vec_local * kLanes;
+      int elem = begin_elem + elem_local;
+      store_float_lanes<kLanes>(
+          dw_partial + static_cast<size_t>(blockIdx.x) * N + elem,
+          dw_acc[iter]);
+    }
+  }
+}
+
+template <typename X>
+__global__ void rmsnorm_bwd_weight_16k_tma_kernel(
+    X* __restrict__ dx, float* __restrict__ dw_partial,
+    float const* __restrict__ weight, float const* __restrict__ rstd_in, int M,
+    CUtensorMap const* __restrict__ x_map,
+    CUtensorMap const* __restrict__ dout_map) {
+  extern __shared__ __align__(128) unsigned char tma_smem_raw[];
+  constexpr int kN = 16384;
+  constexpr int kParts = 8;
+  constexpr int kTileElems = kN / kParts;
+  constexpr int kThreads = 128;
+  constexpr int kStages = 3;
+  constexpr int kLanes = Vec128<X>::kLanes;
+  constexpr int kVecsPerThread = (kTileElems / kLanes) / kThreads;
+  static_assert(kLanes == 8);
+  static_assert(kTileElems == 2048);
+  static_assert(kVecsPerThread == 2);
+
+  X* smem_x = reinterpret_cast<X*>(tma_smem_raw);
+  X* smem_dout = smem_x + kStages * kTileElems;
+  __shared__ uint64_t tma_barrier[kStages];
+  __shared__ uint64_t tma_state[kStages];
+  __shared__ float smem_reduce[2 * 16 * 16];
+  __shared__ uint64_t smem_mbar[4];
+
+  int tid = threadIdx.x;
+  int part = blockIdx.y;
+  int begin_elem = part * kTileElems;
+  if (tid < kStages) {
+    mbarrier_init(tma_barrier + tid, 1);
+  }
+  if (tid < 2) {
+    mbarrier_init(smem_mbar + tid, 1);
+    mbarrier_init(smem_mbar + 2 + tid, ((kThreads + 31) / 32) * kParts);
+  }
+  mbarrier_init_fence();
+  cg::cluster_group cluster = cg::this_cluster();
+  cluster.sync();
+
+  float weight_reg[kVecsPerThread][kLanes];
+  float dw_acc[kVecsPerThread][kLanes];
+#pragma unroll
+  for (int iter = 0; iter < kVecsPerThread; ++iter) {
+    int elem = begin_elem + (iter * kThreads + tid) * kLanes;
+    Vec128<float> w0;
+    Vec128<float> w1;
+    w0.load(weight + elem);
+    w1.load(weight + elem + 4);
+#pragma unroll
+    for (int lane = 0; lane < kLanes; ++lane) {
+      weight_reg[iter][lane] = lane < 4 ? w0.get(lane) : w1.get(lane - 4);
+      dw_acc[iter][lane] = 0.0f;
+    }
+  }
+
+  auto issue_tma = [&](int stage, int row) {
+    if (tid == 0 && row < M) {
+      tma_state[stage] = mbarrier_arrive_expect_tx_state(
+          tma_barrier + stage,
+          static_cast<uint32_t>(2 * kTileElems * sizeof(X)));
+      int chunk = part * (kTileElems / 256);
+      tma_load_3d(smem_x + stage * kTileElems, x_map, tma_barrier + stage,
+                  0, chunk, row);
+      tma_load_3d(smem_dout + stage * kTileElems, dout_map,
+                  tma_barrier + stage, 0, chunk, row);
+    }
+  };
+
+  int row0 = blockIdx.x;
+#pragma unroll
+  for (int stage = 0; stage < kStages; ++stage) {
+    issue_tma(stage, row0 + stage * gridDim.x);
+  }
+  __syncthreads();
+
+  int reduce_stage = 0;
+  int consumer_phase = 0;
+  int producer_phase = 1;
+  int iteration = 0;
+  for (int row = row0; row < M; row += gridDim.x, ++iteration) {
+    int tma_stage = iteration % kStages;
+    mbarrier_wait_state(tma_barrier + tma_stage, tma_state[tma_stage]);
+    fence_view_async_shared();
+
+    float rstd = rstd_in[row];
+    float dot = 0.0f;
+    float xhat_reg[kVecsPerThread][kLanes];
+    float dout_reg[kVecsPerThread][kLanes];
+    float wdy_reg[kVecsPerThread][kLanes];
+#pragma unroll
+    for (int iter = 0; iter < kVecsPerThread; ++iter) {
+      int elem_local = (iter * kThreads + tid) * kLanes;
+      Vec128<X> x_vec;
+      Vec128<X> dout_vec;
+      x_vec.load_shared(smem_x + tma_stage * kTileElems + elem_local);
+      dout_vec.load_shared(smem_dout + tma_stage * kTileElems + elem_local);
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+        float dy_f = dout_vec.get(lane);
+        float x_hat = x_vec.get(lane) * rstd;
+        float wdy = dy_f * weight_reg[iter][lane];
+        xhat_reg[iter][lane] = x_hat;
+        dout_reg[iter][lane] = dy_f;
+        wdy_reg[iter][lane] = wdy;
+        dot = fmaf(x_hat, wdy, dot);
+      }
+    }
+
+    mbarrier_wait(smem_mbar + 2 + reduce_stage, producer_phase);
+    float mean_xhat_wdy =
+        cluster_reduce_sum_mbar(dot, smem_reduce, smem_mbar, reduce_stage,
+                                consumer_phase, kParts) /
+        static_cast<float>(kN);
+    if ((tid & 31) < kParts) {
+      mbarrier_arrive_remote(smem_mbar + 2 + reduce_stage,
+                             static_cast<uint32_t>(tid & 31));
+    }
+
+#pragma unroll
+    for (int iter = 0; iter < kVecsPerThread; ++iter) {
+      int elem_local = (iter * kThreads + tid) * kLanes;
+      int elem = begin_elem + elem_local;
+      Vec128<X> dx_vec;
+      dx_vec.bits = make_uint4(0, 0, 0, 0);
+#pragma unroll
+      for (int lane = 0; lane < kLanes; lane += 2) {
+        float x_hat0 = xhat_reg[iter][lane];
+        float dy_f0 = dout_reg[iter][lane];
+        float wdy0 = wdy_reg[iter][lane];
+        float grad0 = (wdy0 - x_hat0 * mean_xhat_wdy) * rstd;
+        float x_hat1 = xhat_reg[iter][lane + 1];
+        float dy_f1 = dout_reg[iter][lane + 1];
+        float wdy1 = wdy_reg[iter][lane + 1];
+        float grad1 = (wdy1 - x_hat1 * mean_xhat_wdy) * rstd;
+        uint32_t packed;
+        if constexpr (std::is_same_v<X, __half>) {
+          packed = pack_f16x2(grad0, grad1);
+        } else {
+          packed = pack_bf16x2(grad0, grad1);
+        }
+        if (lane == 0) {
+          dx_vec.bits.x = packed;
+        } else if (lane == 2) {
+          dx_vec.bits.y = packed;
+        } else if (lane == 4) {
+          dx_vec.bits.z = packed;
+        } else {
+          dx_vec.bits.w = packed;
+        }
+        dw_acc[iter][lane] += dy_f0 * x_hat0;
+        dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+      }
+      dx_vec.store(dx + static_cast<size_t>(row) * kN + elem);
+    }
+
+    issue_tma(tma_stage, row + kStages * gridDim.x);
+    reduce_stage ^= 1;
+    if (reduce_stage == 0) {
+      consumer_phase ^= 1;
+      producer_phase ^= 1;
+    }
+  }
+
+  reduce_stage ^= 1;
+  if (reduce_stage == 0) {
+    producer_phase ^= 1;
+  }
+  mbarrier_wait(smem_mbar + 2 + reduce_stage, producer_phase);
+#pragma unroll
+  for (int iter = 0; iter < kVecsPerThread; ++iter) {
+    int elem = begin_elem + (iter * kThreads + tid) * kLanes;
+    store_float_lanes<kLanes>(
+        dw_partial + static_cast<size_t>(blockIdx.x) * kN + elem,
+        dw_acc[iter]);
+  }
+}
+
+template <typename X, int kMaxVecs, bool kExact = false>
+__global__ void rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel(
+    X* __restrict__ dx, float* __restrict__ dw_partial,
+    X const* __restrict__ x, float const* __restrict__ weight,
+    X const* __restrict__ dout, float const* __restrict__ rstd_in, int M,
+    int N, int parts) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  using XVec = Vec128<X>;
+  constexpr int kLanes = XVec::kLanes;
+
+  cg::cluster_group cluster = cg::this_cluster();
+  int tid = threadIdx.x;
+  int part = blockIdx.y % parts;
+  int vecs = N / kLanes;
+  int vecs_per_part = (vecs + parts - 1) / parts;
+  int begin_vec = part * vecs_per_part;
+  int end_vec = min(vecs, begin_vec + vecs_per_part);
+  int part_vecs = end_vec - begin_vec;
+  int begin_elem = begin_vec * kLanes;
+  int elems_per_part = vecs_per_part * kLanes;
+  int num_warps = (blockDim.x + 31) >> 5;
+
+  X* smem_x = reinterpret_cast<X*>(smem_raw);
+  X* smem_dout = smem_x + 2 * elems_per_part;
+  __shared__ float smem_reduce[2 * 16 * 16];
+  __shared__ uint64_t smem_mbar[4];
+
+  if (tid < 2) {
+    mbarrier_init(smem_mbar + tid, 1);
+    mbarrier_init(smem_mbar + 2 + tid, num_warps * parts);
+  }
+  mbarrier_init_fence();
+  cluster.sync();
+
+  float weight_reg[kMaxVecs][kLanes];
+  float dw_acc[kMaxVecs][kLanes];
+#pragma unroll
+  for (int iter = 0; iter < kMaxVecs; ++iter) {
+    int vec_local = iter * blockDim.x + tid;
+    if (kExact || vec_local < part_vecs) {
       int elem = begin_elem + vec_local * kLanes;
       Vec128<float> w0;
       Vec128<float> w1;
@@ -3503,12 +4308,8 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
       }
 #pragma unroll
       for (int lane = 0; lane < kLanes; ++lane) {
-        if constexpr (kLanes > 4) {
-          weight_reg[iter][lane] =
-              lane < 4 ? w0.get(lane) : w1.get(lane - 4);
-        } else {
-          weight_reg[iter][lane] = w0.get(lane);
-        }
+        weight_reg[iter][lane] =
+            lane < 4 ? w0.get(lane) : w1.get(lane - 4);
       }
     } else {
 #pragma unroll
@@ -3559,133 +4360,43 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
     } else {
       cp_async_wait_group_0();
     }
-    __syncthreads();
 
     X* cur_x = smem_x + stage * elems_per_part;
     X* cur_dout = smem_dout + stage * elems_per_part;
     float dot = 0.0f;
-    float xhat_reg[kMaxVecs][kLanes];
 
-    if constexpr (kReloadDout) {
 #pragma unroll
-      for (int iter = 0; iter < kMaxVecs; ++iter) {
-        int vec_local = iter * blockDim.x + tid;
-        if (kExact || vec_local < part_vecs) {
-          int elem_local = vec_local * kLanes;
-          XVec x_vec;
-          XVec dout_vec;
-          x_vec.load_shared(cur_x + elem_local);
-          dout_vec.load_shared(cur_dout + elem_local);
+    for (int iter = 0; iter < kMaxVecs; ++iter) {
+      int vec_local = iter * blockDim.x + tid;
+      if (kExact || vec_local < part_vecs) {
+        int elem_local = vec_local * kLanes;
+        XVec x_vec;
+        XVec dout_vec;
+        x_vec.load_shared(cur_x + elem_local);
+        dout_vec.load_shared(cur_dout + elem_local);
+        if constexpr (std::is_same_v<X, __half> ||
+                      std::is_same_v<X, __nv_bfloat16>) {
 #pragma unroll
-          for (int lane = 0; lane < kLanes; ++lane) {
-            float x_hat = x_vec.get(lane) * rstd;
-            float wdy = dout_vec.get(lane) * weight_reg[iter][lane];
-            xhat_reg[iter][lane] = x_hat;
-            dot = fmaf(x_hat, wdy, dot);
+          for (int pair = 0; pair < kLanes / 2; ++pair) {
+            int lane = pair * 2;
+            float2 x_pair =
+                packed_pair_to_float2<X>(uint4_word(x_vec.bits, pair));
+            float2 dout_pair =
+                packed_pair_to_float2<X>(uint4_word(dout_vec.bits, pair));
+            dot = fmaf(x_pair.x * rstd,
+                       dout_pair.x * weight_reg[iter][lane], dot);
+            dot = fmaf(x_pair.y * rstd,
+                       dout_pair.y * weight_reg[iter][lane + 1], dot);
           }
         } else {
 #pragma unroll
           for (int lane = 0; lane < kLanes; ++lane) {
-            xhat_reg[iter][lane] = 0.0f;
-          }
-        }
-      }
-    } else {
-      float dout_reg[kMaxVecs][kLanes];
-      float wdy_reg[kMaxVecs][kLanes];
-#pragma unroll
-      for (int iter = 0; iter < kMaxVecs; ++iter) {
-        int vec_local = iter * blockDim.x + tid;
-        if (kExact || vec_local < part_vecs) {
-          int elem_local = vec_local * kLanes;
-          XVec x_vec;
-          XVec dout_vec;
-          x_vec.load_shared(cur_x + elem_local);
-          dout_vec.load_shared(cur_dout + elem_local);
-#pragma unroll
-          for (int lane = 0; lane < kLanes; ++lane) {
+            float x_hat = x_vec.get(lane) * rstd;
             float dy_f = dout_vec.get(lane);
-            float x_hat = x_vec.get(lane) * rstd;
-            float wdy = dy_f * weight_reg[iter][lane];
-            xhat_reg[iter][lane] = x_hat;
-            dout_reg[iter][lane] = dy_f;
-            wdy_reg[iter][lane] = wdy;
-            dot = fmaf(x_hat, wdy, dot);
-          }
-        } else {
-#pragma unroll
-          for (int lane = 0; lane < kLanes; ++lane) {
-            xhat_reg[iter][lane] = 0.0f;
-            dout_reg[iter][lane] = 0.0f;
-            wdy_reg[iter][lane] = 0.0f;
+            dot = fmaf(x_hat, dy_f * weight_reg[iter][lane], dot);
           }
         }
       }
-
-      mbarrier_wait(smem_mbar + 2 + stage, producer_phase);
-      float mean_xhat_wdy =
-          cluster_reduce_sum_mbar(dot, smem_reduce, smem_mbar, stage,
-                                  consumer_phase, parts) /
-          static_cast<float>(N);
-      fence_view_async_shared();
-      __syncwarp();
-      if ((tid & 31) < parts) {
-        mbarrier_arrive_remote(smem_mbar + 2 + stage,
-                               static_cast<uint32_t>(tid & 31));
-      }
-
-#pragma unroll
-      for (int iter = 0; iter < kMaxVecs; ++iter) {
-        int vec_local = iter * blockDim.x + tid;
-        if (kExact || vec_local < part_vecs) {
-          int elem_local = vec_local * kLanes;
-          int elem = begin_elem + elem_local;
-          XVec dx_vec;
-          dx_vec.bits = make_uint4(0, 0, 0, 0);
-          if constexpr (std::is_same_v<X, __nv_bfloat16>) {
-#pragma unroll
-            for (int lane = 0; lane < kLanes; lane += 2) {
-              float x_hat0 = xhat_reg[iter][lane];
-              float dy_f0 = dout_reg[iter][lane];
-              float wdy0 = wdy_reg[iter][lane];
-              float grad0 = (wdy0 - x_hat0 * mean_xhat_wdy) * rstd;
-              float x_hat1 = xhat_reg[iter][lane + 1];
-              float dy_f1 = dout_reg[iter][lane + 1];
-              float wdy1 = wdy_reg[iter][lane + 1];
-              float grad1 = (wdy1 - x_hat1 * mean_xhat_wdy) * rstd;
-              uint32_t packed = pack_bf16x2(grad0, grad1);
-              if (lane == 0) {
-                dx_vec.bits.x = packed;
-              } else if (lane == 2) {
-                dx_vec.bits.y = packed;
-              } else if (lane == 4) {
-                dx_vec.bits.z = packed;
-              } else {
-                dx_vec.bits.w = packed;
-              }
-              dw_acc[iter][lane] += dy_f0 * x_hat0;
-              dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
-            }
-          } else {
-#pragma unroll
-            for (int lane = 0; lane < kLanes; ++lane) {
-              float x_hat = xhat_reg[iter][lane];
-              float dy_f = dout_reg[iter][lane];
-              float wdy = wdy_reg[iter][lane];
-              float grad = (wdy - x_hat * mean_xhat_wdy) * rstd;
-              dx_vec.set(lane, grad);
-              dw_acc[iter][lane] += dy_f * x_hat;
-            }
-          }
-          dx_vec.store(dx + row * N + elem);
-        }
-      }
-      stage ^= 1;
-      if (stage == 0) {
-        consumer_phase ^= 1;
-        producer_phase ^= 1;
-      }
-      continue;
     }
 
     mbarrier_wait(smem_mbar + 2 + stage, producer_phase);
@@ -3706,20 +4417,82 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
       if (kExact || vec_local < part_vecs) {
         int elem_local = vec_local * kLanes;
         int elem = begin_elem + elem_local;
+        XVec x_vec;
         XVec dout_vec;
         XVec dx_vec;
+        x_vec.load_shared(cur_x + elem_local);
         dout_vec.load_shared(cur_dout + elem_local);
         dx_vec.bits = make_uint4(0, 0, 0, 0);
+        if constexpr (std::is_same_v<X, __nv_bfloat16>) {
 #pragma unroll
-        for (int lane = 0; lane < kLanes; ++lane) {
-          float x_hat = xhat_reg[iter][lane];
-          float dy_f = dout_vec.get(lane);
-          float wdy = dy_f * weight_reg[iter][lane];
-          float grad = (wdy - x_hat * mean_xhat_wdy) * rstd;
-          dx_vec.set(lane, grad);
-          dw_acc[iter][lane] += dy_f * x_hat;
+          for (int pair = 0; pair < kLanes / 2; ++pair) {
+            int lane = pair * 2;
+            float2 x_pair =
+                packed_pair_to_float2<X>(uint4_word(x_vec.bits, pair));
+            float2 dout_pair =
+                packed_pair_to_float2<X>(uint4_word(dout_vec.bits, pair));
+            float x_hat0 = x_pair.x * rstd;
+            float dy_f0 = dout_pair.x;
+            float w_f0 = weight_reg[iter][lane];
+            float grad0 = (dy_f0 * w_f0 - x_hat0 * mean_xhat_wdy) * rstd;
+            float x_hat1 = x_pair.y * rstd;
+            float dy_f1 = dout_pair.y;
+            float w_f1 = weight_reg[iter][lane + 1];
+            float grad1 = (dy_f1 * w_f1 - x_hat1 * mean_xhat_wdy) * rstd;
+            uint32_t packed = pack_bf16x2(grad0, grad1);
+            if (lane == 0) {
+              dx_vec.bits.x = packed;
+            } else if (lane == 2) {
+              dx_vec.bits.y = packed;
+            } else if (lane == 4) {
+              dx_vec.bits.z = packed;
+            } else {
+              dx_vec.bits.w = packed;
+            }
+            dw_acc[iter][lane] += dy_f0 * x_hat0;
+            dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+          }
+        } else if constexpr (std::is_same_v<X, __half>) {
+#pragma unroll
+          for (int pair = 0; pair < kLanes / 2; ++pair) {
+            int lane = pair * 2;
+            float2 x_pair =
+                packed_pair_to_float2<X>(uint4_word(x_vec.bits, pair));
+            float2 dout_pair =
+                packed_pair_to_float2<X>(uint4_word(dout_vec.bits, pair));
+            float x_hat0 = x_pair.x * rstd;
+            float dy_f0 = dout_pair.x;
+            float w_f0 = weight_reg[iter][lane];
+            float grad0 = (dy_f0 * w_f0 - x_hat0 * mean_xhat_wdy) * rstd;
+            float x_hat1 = x_pair.y * rstd;
+            float dy_f1 = dout_pair.y;
+            float w_f1 = weight_reg[iter][lane + 1];
+            float grad1 = (dy_f1 * w_f1 - x_hat1 * mean_xhat_wdy) * rstd;
+            uint32_t packed = pack_f16x2(grad0, grad1);
+            if (lane == 0) {
+              dx_vec.bits.x = packed;
+            } else if (lane == 2) {
+              dx_vec.bits.y = packed;
+            } else if (lane == 4) {
+              dx_vec.bits.z = packed;
+            } else {
+              dx_vec.bits.w = packed;
+            }
+            dw_acc[iter][lane] += dy_f0 * x_hat0;
+            dw_acc[iter][lane + 1] += dy_f1 * x_hat1;
+          }
+        } else {
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            float x_hat = x_vec.get(lane) * rstd;
+            float dy_f = dout_vec.get(lane);
+            float w_f = weight_reg[iter][lane];
+            float grad = (dy_f * w_f - x_hat * mean_xhat_wdy) * rstd;
+            dx_vec.set(lane, grad);
+            dw_acc[iter][lane] += dy_f * x_hat;
+          }
         }
-        dx_vec.store(dx + row * N + elem);
+        dx_vec.store_cg(dx + row * N + elem);
       }
     }
     stage ^= 1;
@@ -3739,8 +4512,7 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
   for (int iter = 0; iter < kMaxVecs; ++iter) {
     int vec_local = iter * blockDim.x + tid;
     if (kExact || vec_local < part_vecs) {
-      int elem_local = vec_local * kLanes;
-      int elem = begin_elem + elem_local;
+      int elem = begin_elem + vec_local * kLanes;
       store_float_lanes<kLanes>(
           dw_partial + static_cast<size_t>(blockIdx.x) * N + elem,
           dw_acc[iter]);
@@ -3748,7 +4520,8 @@ __global__ void rmsnorm_bwd_weight_cluster_smem_persistent_kernel(
   }
 }
 
-template <typename X, int kMaxVecs, bool kExact = false>
+template <typename X, int kMaxVecs, bool kExact = false,
+          bool kKeepInputsInRegisters = false>
 __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
     X* __restrict__ dx, float* __restrict__ dw_partial,
     X const* __restrict__ x, float const* __restrict__ weight,
@@ -3761,9 +4534,16 @@ __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
   int vecs = N / kLanes;
   int vecs_per_part = (vecs + parts - 1) / parts;
   int elems_per_part = vecs_per_part * kLanes;
-  X* smem_x = reinterpret_cast<X*>(smem_raw);
-  X* smem_dout = smem_x + elems_per_part;
-  float* smem_w = reinterpret_cast<float*>(smem_dout + elems_per_part);
+  X* smem_x = nullptr;
+  X* smem_dout = nullptr;
+  float* smem_w = nullptr;
+  if constexpr (kKeepInputsInRegisters) {
+    smem_w = reinterpret_cast<float*>(smem_raw);
+  } else {
+    smem_x = reinterpret_cast<X*>(smem_raw);
+    smem_dout = smem_x + elems_per_part;
+    smem_w = reinterpret_cast<float*>(smem_dout + elems_per_part);
+  }
   __shared__ float smem_reduce[16 * 16];
   __shared__ uint64_t smem_mbar[2];
 
@@ -3812,6 +4592,8 @@ __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
     int row_base = row * N;
     float rstd = rstd_in[row];
     float dot = 0.0f;
+    XVec x_reg[kKeepInputsInRegisters ? kMaxVecs : 1];
+    XVec dout_reg[kKeepInputsInRegisters ? kMaxVecs : 1];
 
 #pragma unroll
     for (int iter = 0; iter < kMaxVecs; ++iter) {
@@ -3824,20 +4606,46 @@ __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
         XVec dyv;
         Vec128<float> w0;
         Vec128<float> w1;
-        xv.load(x + row_base + elem);
-        dyv.load(dout + row_base + elem);
-        xv.store_shared(smem_x + elem_local);
-        dyv.store_shared(smem_dout + elem_local);
+        xv.load_cg(x + row_base + elem);
+        dyv.load_cg(dout + row_base + elem);
+        if constexpr (kKeepInputsInRegisters) {
+          x_reg[iter] = xv;
+          dout_reg[iter] = dyv;
+        } else {
+          xv.store_shared(smem_x + elem_local);
+          dyv.store_shared(smem_dout + elem_local);
+        }
         w0.load_shared(smem_w + elem_local);
         if constexpr (kLanes > 4) {
           w1.load_shared(smem_w + elem_local + 4);
         }
+        if constexpr (sizeof(X) < 4) {
 #pragma unroll
-        for (int lane = 0; lane < kLanes; ++lane) {
-          float x_f = xv.get(lane);
-          float dy_f = dyv.get(lane);
-          float w_f = lane < 4 ? w0.get(lane) : w1.get(lane - 4);
-          dot = fmaf(x_f * rstd, dy_f * w_f, dot);
+          for (int pair = 0; pair < kLanes / 2; ++pair) {
+            int lane = pair * 2;
+            float2 x_pair = packed_pair_to_float2<X>(uint4_word(xv.bits, pair));
+            float2 dy_pair = packed_pair_to_float2<X>(uint4_word(dyv.bits, pair));
+            float w0_f = lane < 4 ? w0.get(lane) : w1.get(lane - 4);
+            float w1_f =
+                (lane + 1) < 4 ? w0.get(lane + 1) : w1.get(lane - 3);
+            float x_hat0 = x_pair.x * rstd;
+            float x_hat1 = x_pair.y * rstd;
+            dot = fmaf(x_hat0, dy_pair.x * w0_f, dot);
+            dot = fmaf(x_hat1, dy_pair.y * w1_f, dot);
+            if constexpr (std::is_same_v<X, __nv_bfloat16>) {
+              dw_acc[iter][lane] += dy_pair.x * x_hat0;
+              dw_acc[iter][lane + 1] += dy_pair.y * x_hat1;
+            }
+          }
+        } else {
+#pragma unroll
+          for (int lane = 0; lane < kLanes; ++lane) {
+            float x_f = xv.get(lane);
+            float dy_f = dyv.get(lane);
+            float w_f = w0.get(lane);
+            float x_hat = x_f * rstd;
+            dot = fmaf(x_hat, dy_f * w_f, dot);
+          }
         }
       }
     }
@@ -3866,8 +4674,13 @@ __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
         XVec dxv;
         Vec128<float> w0;
         Vec128<float> w1;
-        xv.load_shared(smem_x + elem_local);
-        dyv.load_shared(smem_dout + elem_local);
+        if constexpr (kKeepInputsInRegisters) {
+          xv = x_reg[iter];
+          dyv = dout_reg[iter];
+        } else {
+          xv.load_shared(smem_x + elem_local);
+          dyv.load_shared(smem_dout + elem_local);
+        }
         w0.load_shared(smem_w + elem_local);
         if constexpr (kLanes > 4) {
           w1.load_shared(smem_w + elem_local + 4);
@@ -3881,7 +4694,9 @@ __global__ void rmsnorm_bwd_weight_cluster_partial_kernel(
           float x_hat = x_f * rstd;
           float grad = (dy_f * w_f - x_hat * mean_xhat_wdy) * rstd;
           dxv.set(lane, grad);
-          dw_acc[iter][lane] += dy_f * x_hat;
+          if constexpr (!std::is_same_v<X, __nv_bfloat16>) {
+            dw_acc[iter][lane] += dy_f * x_hat;
+          }
         }
         dxv.store(dx + row_base + elem);
       }
@@ -3992,7 +4807,7 @@ __global__ void reduce_dw_partial_chunks_atomic_kernel(
 void launch_reduce_dw(float* dw, float const* dw_partial, float* scratch,
                       int partial_blocks, int N, int reduce_chunks,
                       cudaStream_t stream) {
-  int reduce_threads = N <= 8192 ? 64 : (N <= 16384 ? 128 : 256);
+  int reduce_threads = N <= 8192 ? 64 : 256;
   dim3 block(reduce_threads);
   dim3 grid((N + reduce_threads - 1) / reduce_threads);
   if (reduce_chunks > 1 && scratch != nullptr) {
@@ -4015,6 +4830,114 @@ void launch_reduce_dw(float* dw, float const* dw_partial, float* scratch,
                                                        partial_blocks, N);
 }
 
+template <typename X>
+CUtensorMap make_tma_map_16k(X const* ptr, int M) {
+  alignas(64) CUtensorMap tensor_map{};
+  cuuint64_t global_dim[3] = {256u, 64u, static_cast<cuuint64_t>(M)};
+  cuuint64_t global_stride[2] = {
+      256u * static_cast<cuuint64_t>(sizeof(X)),
+      16384u * static_cast<cuuint64_t>(sizeof(X))};
+  cuuint32_t box_dim[3] = {256u, 8u, 1u};
+  cuuint32_t elem_stride[3] = {1u, 1u, 1u};
+  CUtensorMapDataType dtype =
+      std::is_same_v<X, __half> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16
+                                : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+  CU_CHECK(cuTensorMapEncodeTiled(
+      &tensor_map, dtype, 3, const_cast<X*>(ptr), global_dim, global_stride,
+      box_dim, elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  return tensor_map;
+}
+
+template <typename X>
+CUtensorMap* cached_tma_maps_16k(X const* x, X const* dout, int M,
+                                 cudaStream_t stream) {
+  struct Cache {
+    int device = -1;
+    X const* x = nullptr;
+    X const* dout = nullptr;
+    int M = 0;
+    CUtensorMap* maps = nullptr;
+    alignas(128) CUtensorMap host_maps[2]{};
+  };
+  thread_local Cache cache;
+  int device = 0;
+  CUDA_CHECK(cudaGetDevice(&device));
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+  bool capturing = capture_status != cudaStreamCaptureStatusNone;
+  bool cache_miss = cache.maps == nullptr || cache.device != device ||
+                    cache.x != x || cache.dout != dout || cache.M != M;
+  if (capturing && cache_miss) {
+    return nullptr;
+  }
+  if (cache.maps == nullptr || cache.device != device) {
+    if (cache.maps != nullptr) {
+      CUDA_CHECK(cudaFree(cache.maps));
+    }
+    cache.device = device;
+    CUDA_CHECK(cudaMalloc(&cache.maps, 2 * sizeof(CUtensorMap)));
+  }
+  if (cache.x != x || cache.dout != dout || cache.M != M) {
+    cache.host_maps[0] = make_tma_map_16k(x, M);
+    cache.host_maps[1] = make_tma_map_16k(dout, M);
+    CUDA_CHECK(cudaMemcpyAsync(cache.maps, cache.host_maps,
+                               2 * sizeof(CUtensorMap),
+                               cudaMemcpyHostToDevice, stream));
+    cache.x = x;
+    cache.dout = dout;
+    cache.M = M;
+  }
+  return cache.maps;
+}
+
+template <typename X>
+bool launch_bwd_16k_tma(Options const& options, X* dx, float* dw,
+                        X const* x, float const* weight, X const* dout,
+                        float const* rstd, float* dw_partial,
+                        float* dw_partial_scratch, int partial_blocks,
+                        cudaStream_t stream) {
+  if (options.N != 16384 || options.H != 1 || dw == nullptr ||
+      dw_partial == nullptr || weight == nullptr) {
+    return false;
+  }
+  constexpr int kParts = 8;
+  constexpr int kThreads = 128;
+  constexpr int kTileElems = 2048;
+  constexpr int kStages = 3;
+  constexpr int kSmemBytes =
+      2 * kStages * kTileElems * static_cast<int>(sizeof(X));
+  CUtensorMap* maps = cached_tma_maps_16k(x, dout, options.M, stream);
+  if (maps == nullptr) {
+    return false;
+  }
+
+  auto kernel = rmsnorm_bwd_weight_16k_tma_kernel<X>;
+  CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+  CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 1;
+  attrs[0].val.clusterDim.y = kParts;
+  attrs[0].val.clusterDim.z = 1;
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(partial_blocks, kParts, 1);
+  config.blockDim = dim3(kThreads, 1, 1);
+  config.dynamicSmemBytes = kSmemBytes;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, dx, dw_partial, weight, rstd,
+                                options.M, maps, maps + 1));
+  int reduce_chunks =
+      bwd_reduce_chunks(options.N, partial_blocks, options.reduce_chunks);
+  launch_reduce_dw(dw, dw_partial, dw_partial_scratch, partial_blocks,
+                   options.N, reduce_chunks, stream);
+  return true;
+}
+
 template <typename X, typename RO>
 void launch_fwd(Options const& options, X* out, RO* residual_out,
                 float* rstd, X const* x, float const* weight,
@@ -4026,6 +4949,16 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
     // Residual fwd benefits from fewer threads per row than the no-residual
     // path here; broader 128-thread use hits cached-kernel resource limits.
     if (residual == nullptr && residual_out == nullptr && rstd == nullptr &&
+        weight != nullptr && bias == nullptr &&
+        options.N == 1024) {
+      threads = 256;
+      threads_per_row = 64;
+    } else if (residual == nullptr && residual_out == nullptr && rstd == nullptr &&
+        weight != nullptr && bias == nullptr &&
+        options.N == 2048) {
+      threads = 256;
+      threads_per_row = 128;
+    } else if (residual == nullptr && residual_out == nullptr && rstd == nullptr &&
         weight != nullptr && bias == nullptr &&
         (options.N == 8192 || options.N == 32768)) {
       threads_per_row = threads;
@@ -4043,10 +4976,14 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
     } else if (residual != nullptr && residual_out != nullptr &&
                std::is_same_v<X, RO> && options.N == 8192) {
       threads = 1024;
-      threads_per_row = 512;
+      threads_per_row = 256;
     } else if (residual != nullptr && residual_out != nullptr &&
                options.N == 8192) {
       threads_per_row = 128;
+    } else if (residual != nullptr && residual_out != nullptr &&
+               std::is_same_v<X, RO> && options.N == 16384) {
+      threads = 1024;
+      threads_per_row = 512;
     } else if (residual != nullptr && residual_out != nullptr &&
                options.N == 16384) {
       threads_per_row = 256;
@@ -4149,6 +5086,9 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
       } else if (options.N == 1024) {
         threads = 32;
         threads_per_row = 32;
+      } else if (options.N == 2048) {
+        threads = 256;
+        threads_per_row = 256;
       } else if (options.N == 16384) {
         threads = 1024;
         threads_per_row = 1024;
@@ -4158,6 +5098,10 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
       }
     }
   }
+  if (threads < threads_per_row) {
+    throw std::invalid_argument(
+        "RMSNorm forward launch requires threads >= threads_per_row");
+  }
   using XVec = Vec128<X>;
   int vecs = options.N / XVec::kLanes;
   int vecs_per_thread = (vecs + threads_per_row - 1) / threads_per_row;
@@ -4165,6 +5109,34 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
   dim3 grid((options.M + rows_per_cta - 1) / rows_per_cta);
   dim3 block(threads);
   if constexpr (std::is_same_v<X, RO>) {
+    if (weight != nullptr && bias == nullptr && residual == nullptr &&
+        residual_out == nullptr && rstd == nullptr && rows_per_cta > 1 &&
+        vecs == vecs_per_thread * threads_per_row) {
+      if (threads_per_row == 64 && vecs_per_thread == 2) {
+        if (options.H == 1) {
+          rmsnorm_fwd_weight_multirow_tpr_full_kernel<X, 2, 64, true>
+              <<<grid, block, 0, stream>>>(out, x, weight, options.M,
+                                           options.N, options.H, options.eps);
+        } else {
+          rmsnorm_fwd_weight_multirow_tpr_full_kernel<X, 2, 64>
+              <<<grid, block, 0, stream>>>(out, x, weight, options.M,
+                                           options.N, options.H, options.eps);
+        }
+        return;
+      }
+      if (threads_per_row == 128 && vecs_per_thread == 2) {
+        if (options.H == 1) {
+          rmsnorm_fwd_weight_multirow_tpr_full_kernel<X, 2, 128, true>
+              <<<grid, block, 0, stream>>>(out, x, weight, options.M,
+                                           options.N, options.H, options.eps);
+        } else {
+          rmsnorm_fwd_weight_multirow_tpr_full_kernel<X, 2, 128>
+              <<<grid, block, 0, stream>>>(out, x, weight, options.M,
+                                           options.N, options.H, options.eps);
+        }
+        return;
+      }
+    }
     if (weight != nullptr && bias == nullptr && residual == nullptr &&
         residual_out == nullptr && rstd == nullptr && rows_per_cta > 1 &&
         threads_per_row == 32 &&
@@ -4243,7 +5215,8 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
         (std::is_same_v<X, RO> ||
          (!std::is_same_v<X, RO> &&
           (options.N == 512 || options.N == 1024 || options.N == 2048 ||
-           options.N == 4096 || options.N == 8192)));
+           options.N == 4096 || options.N == 8192 || options.N == 16384 ||
+           options.N == 32768)));
     // Exact residual rows avoid the generic nullable/predicated cached kernel
     // and vectorize both residual_out and out stores.
     if (threads_per_row == 32 && vecs_per_thread == 1) {
@@ -4338,8 +5311,32 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
       }
       if (options.N == 8192) {
         dim3 vec4_grid(options.M);
+        dim3 vec4_block(256);
+        launch_fwd_residual_mixed_vec4<X, 8, 256>(
+            options.H == 1, vec4_grid, vec4_block, stream, out, residual_out,
+            x, residual, weight, options.M, options.N, options.H, options.eps);
+        return;
+      }
+      if (options.N == 16384) {
+        if constexpr (std::is_same_v<X, __half>) {
+          dim3 vec4_grid((options.M + 1) / 2);
+          dim3 vec4_block(512);
+          launch_fwd_residual_mixed_vec4<X, 16, 256>(
+              options.H == 1, vec4_grid, vec4_block, stream, out, residual_out,
+              x, residual, weight, options.M, options.N, options.H, options.eps);
+        } else {
+          dim3 vec4_grid((options.M + 1) / 2);
+          dim3 vec4_block(1024);
+          launch_fwd_residual_mixed_vec4<X, 8, 512>(
+              options.H == 1, vec4_grid, vec4_block, stream, out, residual_out,
+              x, residual, weight, options.M, options.N, options.H, options.eps);
+        }
+        return;
+      }
+      if (options.N == 32768) {
+        dim3 vec4_grid(options.M);
         dim3 vec4_block(1024);
-        launch_fwd_residual_mixed_vec4<X, 2, 1024>(
+        launch_fwd_residual_mixed_vec4<X, 8, 1024>(
             options.H == 1, vec4_grid, vec4_block, stream, out, residual_out,
             x, residual, weight, options.M, options.N, options.H, options.eps);
         return;
@@ -4706,11 +5703,6 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
     if (weight != nullptr && bias == nullptr && residual == nullptr &&
         residual_out == nullptr && rstd == nullptr && rows_per_cta == 1) {
       int parts = fwd_split_parts<X>(options.N);
-      if constexpr (std::is_same_v<X, __half>) {
-        if (options.N == 65536) {
-          parts = 4;
-        }
-      }
       if constexpr (sizeof(X) >= 4) {
         if (options.N == 262144) {
           // The largest fp32 no-residual row uses a shared-memory cp.async
@@ -4804,7 +5796,7 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
               CUDA_CHECK(cudaFuncSetAttribute(
                   kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
             });
-            config.dynamicSmemBytes = 0;
+            config.dynamicSmemBytes = options.N == 65536 ? smem_bytes : 0;
             CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, out, x, weight,
                                           options.M, options.N, options.H,
                                           options.eps));
@@ -5031,7 +6023,7 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
       }
       if (vecs == vecs_per_thread * threads && vecs_per_thread == 2) {
         if (options.H == 1 && options.N == 4096) {
-          rmsnorm_fwd_weight_full_kernel<X, 2, true, true>
+          rmsnorm_fwd_weight_full_kernel<X, 2, false, true>
               <<<options.M, block, 0, stream>>>(out, x, weight, options.M,
                                                 options.N, options.H,
                                                 options.eps);
@@ -5066,6 +6058,24 @@ void launch_fwd(Options const& options, X* out, RO* residual_out,
                                                   options.eps);
           }
         } else {
+          if constexpr (std::is_same_v<X, __half>) {
+            if (options.H == 1 && options.N == 8192) {
+              rmsnorm_fwd_weight_cpasync_full_kernel<X, 4, 256>
+                  <<<options.M, block, options.N * sizeof(X), stream>>>(
+                      out, x, weight, options.M, options.N, options.H,
+                      options.eps);
+              return;
+            }
+          }
+          if constexpr (std::is_same_v<X, __nv_bfloat16>) {
+            if (options.H == 1 && options.N == 8192) {
+              rmsnorm_fwd_weight_cpasync_full_kernel<X, 4, 256>
+                  <<<options.M, block, options.N * sizeof(X), stream>>>(
+                      out, x, weight, options.M, options.N, options.H,
+                      options.eps);
+              return;
+            }
+          }
           rmsnorm_fwd_weight_full_kernel<X, 4>
               <<<options.M, block, 0, stream>>>(out, x, weight, options.M,
                                                 options.N, options.H,
@@ -5216,6 +6226,14 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
         return;
       }
     }
+    if constexpr (std::is_same_v<X, __half> ||
+                  std::is_same_v<X, __nv_bfloat16>) {
+      if (launch_bwd_16k_tma<X>(options, dx, dw, x, weight, dout, rstd,
+                                dw_partial, dw_partial_scratch,
+                                partial_blocks, stream)) {
+        return;
+      }
+    }
     dim3 block(options.threads);
     if (parts == 1) {
       int smem_bytes =
@@ -5280,13 +6298,23 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
       vecs_per_thread = (vecs_per_part + options.threads - 1) / options.threads;
       int elems_per_part = vecs_per_part * XVec::kLanes;
       bool use_smem_cluster =
-          (sizeof(X) < 4 && (options.N <= 16384 || options.N >= 262144)) ||
+          (sizeof(X) < 4 &&
+           (options.N <= 16384 || options.N == 65536 ||
+            options.N >= 262144)) ||
           (sizeof(X) >= 4 && options.N >= 16384);
+      bool use_cpasync_weightreg =
+          sizeof(X) < 4 && options.N == 65536 && options.threads != 128 &&
+          use_smem_cluster;
+      bool keep_partial_inputs_in_registers =
+          sizeof(X) < 4 && options.N == 131072 && options.threads == 512;
       int smem_bytes =
-          use_smem_cluster
-              ? 4 * elems_per_part * static_cast<int>(sizeof(X))
-              : elems_per_part *
-                    (2 * static_cast<int>(sizeof(X)) + static_cast<int>(sizeof(float)));
+          keep_partial_inputs_in_registers
+              ? elems_per_part * static_cast<int>(sizeof(float))
+              : (use_smem_cluster
+                     ? 4 * elems_per_part * static_cast<int>(sizeof(X))
+                     : elems_per_part *
+                           (2 * static_cast<int>(sizeof(X)) +
+                            static_cast<int>(sizeof(float))));
       using ClusterKernel = void (*)(X*, float*, X const*, float const*, X const*,
                                      float const*, int, int, int);
       cudaLaunchAttribute attrs[1]{};
@@ -5303,9 +6331,49 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
       config.numAttrs = 1;
       bool reload_dout = vecs_per_thread > 4;
       bool exact_tile = vecs_per_part == vecs_per_thread * options.threads;
+      if (use_cpasync_weightreg && vecs_per_thread <= 4) {
+        ClusterKernel kernel =
+            vecs_per_thread <= 1
+                ? (exact_tile
+                       ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 1,
+                                                                             true>
+                       : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 1,
+                                                                             false>)
+            : (vecs_per_thread <= 2
+                   ? (exact_tile
+                          ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 2,
+                                                                                true>
+                          : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 2,
+                                                                                false>)
+                   : (exact_tile
+                          ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 4,
+                                                                                true>
+                          : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 4,
+                                                                                false>));
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        if (smem_bytes >= 48 * 1024) {
+          CUDA_CHECK(cudaFuncSetAttribute(
+              kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        }
+        CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, dx, dw_partial, x, weight,
+                                      dout, rstd, options.M, options.N, parts));
+        int reduce_chunks =
+            bwd_reduce_chunks(options.N, partial_blocks, options.reduce_chunks);
+        launch_reduce_dw(dw, dw_partial, dw_partial_scratch, partial_blocks,
+                         options.N, reduce_chunks, stream);
+        return;
+      }
       if (vecs_per_thread <= 1) {
         ClusterKernel kernel = nullptr;
-        if (use_smem_cluster) {
+        if (use_cpasync_weightreg) {
+          kernel =
+              exact_tile
+                  ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 1,
+                                                                        true>
+                  : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 1,
+                                                                        false>;
+        } else if (use_smem_cluster) {
           if (reload_dout) {
             kernel =
                 exact_tile
@@ -5336,7 +6404,14 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
                                       dout, rstd, options.M, options.N, parts));
       } else if (vecs_per_thread <= 2) {
         ClusterKernel kernel = nullptr;
-        if (use_smem_cluster) {
+        if (use_cpasync_weightreg) {
+          kernel =
+              exact_tile
+                  ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 2,
+                                                                        true>
+                  : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 2,
+                                                                        false>;
+        } else if (use_smem_cluster) {
           if (reload_dout) {
             kernel =
                 exact_tile
@@ -5353,9 +6428,17 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
                                                                         false, false>;
           }
         } else {
-          kernel = exact_tile
-                       ? rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, true>
-                       : rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, false>;
+          if (keep_partial_inputs_in_registers) {
+            kernel = exact_tile
+                         ? rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, true,
+                                                                     true>
+                         : rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, false,
+                                                                     true>;
+          } else {
+            kernel = exact_tile
+                         ? rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, true>
+                         : rmsnorm_bwd_weight_cluster_partial_kernel<X, 2, false>;
+          }
         }
         CUDA_CHECK(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
@@ -5367,7 +6450,14 @@ void launch_bwd(Options const& options, X* dx, X* dresidual, float* dw,
                                       dout, rstd, options.M, options.N, parts));
       } else if (vecs_per_thread <= 4) {
         ClusterKernel kernel = nullptr;
-        if (use_smem_cluster) {
+        if (use_cpasync_weightreg) {
+          kernel =
+              exact_tile
+                  ? rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 4,
+                                                                        true>
+                  : rmsnorm_bwd_weight_cluster_cpasync_weightreg_kernel<X, 4,
+                                                                        false>;
+        } else if (use_smem_cluster) {
           if (reload_dout) {
             kernel =
                 exact_tile
@@ -5802,6 +6892,16 @@ template <typename X, typename RO>
 double benchmark(Options const& options, DeviceBuffers<X, RO>& d) {
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
+
+  if (options.mode == Mode::kBackward) {
+    launch_bwd(options, d.dx, options.has_dresidual_out ? d.dresidual : nullptr,
+               options.has_weight ? d.dw : nullptr, options.has_bias ? d.db : nullptr,
+               d.x, options.has_weight ? d.weight : nullptr, d.dout,
+               options.has_dresidual_out ? d.dresidual_out : nullptr, d.rstd,
+               d.dw_partial, d.dw_partial_scratch, stream);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
 
   CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
   for (int i = 0; i < options.iterations; ++i) {

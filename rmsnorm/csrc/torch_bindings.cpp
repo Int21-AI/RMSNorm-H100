@@ -70,6 +70,24 @@ void check_same_shape(at::Tensor const& tensor, at::Tensor const& ref, char cons
 }
 
 int fwd_threads_for_dtype(int dtype_code, int64_t N) {
+  if (dtype_code == 2 && N == 2048) {
+    return 256;
+  }
+  if (dtype_code == 2 && N == 4096) {
+    return 448;
+  }
+  if (dtype_code == 2 && N == 16384) {
+    return 256;
+  }
+  if (dtype_code != 2 && N == 2048) {
+    return 256;
+  }
+  if (dtype_code == 1 && N == 8192) {
+    return 256;
+  }
+  if (dtype_code == 0 && N == 8192) {
+    return 256;
+  }
   if (dtype_code != 2 && N == 8192) {
     return 128;
   }
@@ -84,6 +102,15 @@ int bwd_threads_for_dtype(int dtype_code, int64_t N) {
   // regress there, so keep the override out of the shared CUDA heuristic.
   if (dtype_code == 2 && N == 32768) {
     return 256;
+  }
+  if (dtype_code == 0 && N == 16384) {
+    return 256;
+  }
+  if (dtype_code == 0 && N == 65536) {
+    return 128;
+  }
+  if (dtype_code == 1 && N == 65536) {
+    return 128;
   }
   return rmsnorm_cuda_bwd_threads(static_cast<int>(N));
 }

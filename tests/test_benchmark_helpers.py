@@ -3,6 +3,8 @@
 
 import argparse
 import io
+import sys
+import types
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -44,6 +46,82 @@ class BenchmarkHelperTest(unittest.TestCase):
     def test_import_does_not_load_benchmark_ops(self):
         self.assertIsNone(benchmark_rmsnorm._BENCHMARK_OPS)
 
+    def test_benchmark_ops_wraps_quack_tuned_entry_points(self):
+        previous_ops = benchmark_rmsnorm._BENCHMARK_OPS
+        previous_module = benchmark_rmsnorm._QUACK_MODULE
+        previous_fwd_tuner = benchmark_rmsnorm._QUACK_FWD_TUNER
+        previous_bwd_tuner = benchmark_rmsnorm._QUACK_BWD_TUNER
+        benchmark_rmsnorm._BENCHMARK_OPS = None
+        events = []
+
+        quack_module = types.ModuleType("quack")
+        quack_rmsnorm = types.ModuleType("quack.rmsnorm")
+        triton_module = types.ModuleType("triton")
+        triton_testing = types.ModuleType("triton.testing")
+        triton_testing.do_bench = mock.Mock(name="do_bench")
+
+        def fake_fwd_tuned(*args, **kwargs):
+            events.append(("fwd_tuned", args, kwargs))
+            fake_fwd_tuned.best_config = "fwd-config"
+
+        def fake_bwd_tuned(*args, **kwargs):
+            events.append(("bwd_tuned", args, kwargs))
+            fake_bwd_tuned.best_config = "bwd-config"
+
+        fake_fwd_tuned.configs = [object(), object()]
+        fake_fwd_tuned.cache = {}
+        fake_bwd_tuned.configs = [object(), object()]
+        fake_bwd_tuned.cache = {}
+
+        quack_rmsnorm.rmsnorm_fwd_tuned = fake_fwd_tuned
+        quack_rmsnorm.rmsnorm_bwd_tuned = fake_bwd_tuned
+        quack_rmsnorm._get_sm_count = lambda N, device: 2
+
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "quack": quack_module,
+                    "quack.rmsnorm": quack_rmsnorm,
+                    "triton": triton_module,
+                    "triton.testing": triton_testing,
+                },
+            ):
+                _, _, quack_fwd, quack_bwd, _ = benchmark_rmsnorm.benchmark_ops()
+                x = torch.empty(2, 16, dtype=torch.float16)
+                weight = torch.empty(16, dtype=torch.float32)
+                quack_fwd(x, weight)
+                quack_bwd(x, weight, torch.empty_like(x), torch.empty(2))
+        finally:
+            benchmark_rmsnorm._BENCHMARK_OPS = previous_ops
+            benchmark_rmsnorm._QUACK_MODULE = previous_module
+            benchmark_rmsnorm._QUACK_FWD_TUNER = previous_fwd_tuner
+            benchmark_rmsnorm._QUACK_BWD_TUNER = previous_bwd_tuner
+
+        self.assertEqual([event[0] for event in events], ["fwd_tuned", "bwd_tuned"])
+        self.assertFalse(events[0][1][9])
+        self.assertFalse(events[0][1][10])
+        self.assertFalse(events[1][1][10])
+        self.assertTrue(events[1][1][11])
+        self.assertEqual(events[0][2], {})
+        self.assertEqual(events[1][2], {})
+
+    def test_benchmark_ops_requires_quack_tuned_entry_points(self):
+        previous_ops = benchmark_rmsnorm._BENCHMARK_OPS
+        benchmark_rmsnorm._BENCHMARK_OPS = None
+        quack_module = types.ModuleType("quack")
+        quack_rmsnorm = types.ModuleType("quack.rmsnorm")
+        quack_rmsnorm._get_sm_count = lambda N, device: 2
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {"quack": quack_module, "quack.rmsnorm": quack_rmsnorm},
+            ):
+                with self.assertRaisesRegex(ImportError, "autotuned benchmark APIs"):
+                    benchmark_rmsnorm.benchmark_ops()
+        finally:
+            benchmark_rmsnorm._BENCHMARK_OPS = previous_ops
+
     def test_parse_pair(self):
         self.assertEqual(parse_pair("8192,262144"), (8192, 262144))
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -74,13 +152,14 @@ class BenchmarkHelperTest(unittest.TestCase):
                     (16384, 131072),
                     (8192, 262144),
                 ],
-                "min_speedup": 0.08,
+                "fail_ratio": 1.01,
             },
         )
         self.assertEqual(
             preset_mn_pairs("large-backward"),
             [(32768, 65536), (16384, 131072), (8192, 262144)],
         )
+        self.assertEqual(preset_mn_pairs("mid-backward"), [(32768, 16384)])
         self.assertEqual(
             preset_gate_config("mid-backward"),
             {
@@ -91,7 +170,7 @@ class BenchmarkHelperTest(unittest.TestCase):
                 "residual_out_dtype": "same",
                 "dtype_names": ("bfloat16", "float16"),
                 "mn_pairs": [(32768, 16384)],
-                "min_speedup": 0.10,
+                "fail_ratio": 1.01,
             },
         )
         self.assertEqual(format_mn_pair(32768, 32768), "32768x32768")
@@ -102,15 +181,15 @@ class BenchmarkHelperTest(unittest.TestCase):
         self.assertEqual(
             format_preset_listing(),
             (
-                "preset,mode,gate_dtypes,min_speedup,rows,description\n"
+                "preset,mode,gate_dtypes,fail_ratio,rows,description\n"
                 "large-backward,backward,"
-                "bfloat16|float16,0.08,"
+                "bfloat16|float16,1.01,"
                 "32768x65536|16384x131072|8192x262144,"
-                "large backward rows with maintained fp16 and bf16 speedup gates\n"
+                "large backward rows with maintained fp16 and bf16 1% ratio gates\n"
                 "mid-backward,backward,"
-                "bfloat16|float16,0.10,"
+                "bfloat16|float16,1.01,"
                 "32768x16384,"
-                "mid-sized backward row with maintained fp16 and bf16 speedup gates"
+                "mid-sized backward row with maintained fp16 and bf16 1% ratio gates"
             ),
         )
         self.assertEqual(
@@ -124,8 +203,7 @@ class BenchmarkHelperTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown benchmark preset"):
             preset_gate_config("not-a-preset")
         self.assertEqual(gate_preset_names("large-backward"), ("large-backward",))
-        self.assertEqual(gate_preset_names("mid-backward"), ("mid-backward",))
-        self.assertEqual(gate_preset_names("all"), ("mid-backward", "large-backward"))
+        self.assertEqual(gate_preset_names("all"), ("large-backward", "mid-backward"))
         with self.assertRaisesRegex(ValueError, "unknown benchmark gate"):
             gate_preset_names("not-a-gate")
 
@@ -272,7 +350,7 @@ class BenchmarkHelperTest(unittest.TestCase):
             self.assertEqual(input_pool_size, 64)
             self.assertEqual(pool_memory_fraction, 0.8)
             self.assertEqual(provider_order, "balanced")
-            return 1.0, 1.25, None, input_pool_size
+            return 1.0, 1.25, None, input_pool_size, "config"
 
         output = io.StringIO()
         with mock.patch.object(benchmark_rmsnorm, "bench_pair", side_effect=fake_bench_pair):
@@ -281,11 +359,26 @@ class BenchmarkHelperTest(unittest.TestCase):
                     run_gate(args)
 
         text = output.getvalue()
-        self.assertIn("preset,dtype,M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup", text)
-        self.assertIn("large-backward,bfloat16,32768,65536,64,1.000000,1.250000,0.8000,0.2500", text)
-        self.assertIn("large-backward,float16,8192,262144,64,1.000000,1.250000,0.8000,0.2500", text)
-        self.assertIn("mid-backward,bfloat16,32768,16384,64,1.000000,1.250000,0.8000,0.2500", text)
-        self.assertIn("mid-backward,float16,32768,16384,64,1.000000,1.250000,0.8000,0.2500", text)
+        self.assertIn(
+            "preset,dtype,M,N,pool_size,rmsnorm_ms,quack_ms,ratio,speedup,quack_config",
+            text,
+        )
+        self.assertIn(
+            "large-backward,bfloat16,32768,65536,64,1.000000,1.250000,0.8000,0.2500,config",
+            text,
+        )
+        self.assertIn(
+            "large-backward,float16,8192,262144,64,1.000000,1.250000,0.8000,0.2500,config",
+            text,
+        )
+        self.assertIn(
+            "mid-backward,bfloat16,32768,16384,64,1.000000,1.250000,0.8000,0.2500,config",
+            text,
+        )
+        self.assertIn(
+            "mid-backward,float16,32768,16384,64,1.000000,1.250000,0.8000,0.2500,config",
+            text,
+        )
         self.assertIn("summary,large-backward,bfloat16,3,0.2500,0.2500,0.2500", text)
         self.assertIn("summary,large-backward,float16,3,0.2500,0.2500,0.2500", text)
         self.assertIn("summary,mid-backward,bfloat16,1,0.2500,0.2500,0.2500", text)
@@ -312,23 +405,33 @@ class BenchmarkHelperTest(unittest.TestCase):
                 "benchmark_ops",
                 return_value=(ours_fwd, object(), quack_fwd, object(), fake_do_bench),
             ):
-                with mock.patch.object(torch, "manual_seed"):
-                    with mock.patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")):
-                        ours, quack, quack_error, pool_size = benchmark_rmsnorm.bench_pair(
-                            2,
-                            16,
-                            torch.float16,
-                            backward=False,
-                            residual=False,
-                            residual_out_dtype="same",
-                            warmup=10,
-                            rep=100,
-                            provider_order="rmsnorm-first",
-                        )
+                with mock.patch.object(
+                    benchmark_rmsnorm, "selected_quack_config", return_value="config"
+                ):
+                    with mock.patch.object(torch, "manual_seed"):
+                        with mock.patch.object(
+                            torch.cuda,
+                            "synchronize",
+                            side_effect=lambda: events.append("sync"),
+                        ):
+                            result = benchmark_rmsnorm.bench_pair(
+                                2,
+                                16,
+                                torch.float16,
+                                backward=False,
+                                residual=False,
+                                residual_out_dtype="same",
+                                warmup=10,
+                                rep=100,
+                                provider_order="rmsnorm-first",
+                            )
 
-        self.assertEqual((ours, quack, quack_error, pool_size), (1.0, 2.0, None, 2))
-        self.assertEqual(events[:3], ["ours_fwd", "quack_fwd", "sync"])
-        self.assertEqual(events[3], "bench")
+        self.assertEqual(result, (1.0, 2.0, None, 2, "config"))
+        self.assertEqual(
+            events[:5],
+            ["quack_fwd", "sync", "ours_fwd", "quack_fwd", "sync"],
+        )
+        self.assertEqual(events[5], "bench")
 
     def test_balanced_provider_order_averages_both_orders(self):
         events = []
@@ -352,22 +455,25 @@ class BenchmarkHelperTest(unittest.TestCase):
                 "benchmark_ops",
                 return_value=(ours_fwd, object(), quack_fwd, object(), fake_do_bench),
             ):
-                with mock.patch.object(torch, "manual_seed"):
-                    with mock.patch.object(torch.cuda, "is_available", return_value=False):
-                        with mock.patch.object(torch.cuda, "synchronize"):
-                            ours, quack, quack_error, pool_size = benchmark_rmsnorm.bench_pair(
-                                2,
-                                16,
-                                torch.float16,
-                                backward=False,
-                                residual=False,
-                                residual_out_dtype="same",
-                                warmup=10,
-                                rep=100,
-                                provider_order="balanced",
-                            )
+                with mock.patch.object(
+                    benchmark_rmsnorm, "selected_quack_config", return_value="config"
+                ):
+                    with mock.patch.object(torch, "manual_seed"):
+                        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+                            with mock.patch.object(torch.cuda, "synchronize"):
+                                result = benchmark_rmsnorm.bench_pair(
+                                    2,
+                                    16,
+                                    torch.float16,
+                                    backward=False,
+                                    residual=False,
+                                    residual_out_dtype="same",
+                                    warmup=10,
+                                    rep=100,
+                                    provider_order="balanced",
+                                )
 
-        self.assertEqual((ours, quack, quack_error, pool_size), (4.0, 4.0, None, 1))
+        self.assertEqual(result, (4.0, 4.0, None, 1, "config"))
         bench_events = [event for event in events if event == "bench"]
         self.assertEqual(len(bench_events), 4)
 

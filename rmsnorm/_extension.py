@@ -39,6 +39,7 @@ def get_extension():
         sources=[str(p) for p in sources],
         extra_cflags=["-O3", "-std=c++17"],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+        extra_ldflags=["-lcuda"],
         verbose=os.environ.get("RMSNORM_VERBOSE_BUILD", "0") == "1",
         with_cuda=True,
     )

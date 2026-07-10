@@ -4,25 +4,28 @@
 > [INT21's PTX Kernel Factory](https://int21.ai).
 
 `rmsnorm-h100` provides production-oriented RMSNorm kernels for NVIDIA Hopper
-(`sm_90`), validated on an NVIDIA GH200 on June 8, 2026. The implementation
+(`sm_90`), validated on an NVIDIA GH200 on July 8, 2026. The implementation
 supports forward and backward execution and is written in CUDA C++ and inline
 PTX.
 
 ## Highlights
 
-- **8.17% faster than QuACK** on geometric mean across the 11 maintained BF16
-  forward shapes.
-- **15.03% to 34.09% faster** across the selected FP16 and BF16 backward
-  comparisons.
-- Passed the complete validated package suite: **48 tests plus 65 subtests**.
+- **1.45% BF16 and 1.56% FP16 forward geomean speedups** across the complete
+  11-row benchmark against freshly autotuned QuACK.
+- Corrected FP32 forward geomean: **0.03%**. A prior 16.19% claim came from two
+  invalid partial-row launches and has been removed.
+- Backward gate rows are maintained against autotuned QuACK with a 1% ratio
+  tolerance for BF16 and FP16.
+- Passed the complete validated package suite: **52 tests plus 72 subtests**.
 - Supports FP16, BF16, and FP32; residual fusion; autograd; affine weight and
   bias; per-head parameters; and very large hidden dimensions.
 - Uses no CUTLASS, CuTe, Triton, or QuACK implementation dependency. QuACK is
   used only as an external correctness and performance comparison target.
 
-The benchmark report includes the boundaries of the result: the slowest FP16
-and FP32 forward rows were 0.42% and 0.84% behind QuACK. These are
-operator-level measurements, not claims about full-model speedups.
+The benchmark report includes the boundaries of the result: some forward and
+backward rows remain behind autotuned QuACK after enabling QuACK autotune per
+shape. These are operator-level measurements, not claims about full-model
+speedups.
 Application-level gains depend on the model, workload, shapes, and surrounding
 software stack. See [GH200 Results](#gh200-results) for the measured cases and
 the paths to the raw CSV output.
@@ -69,7 +72,7 @@ For development:
 
 ```bash
 python -m pip install -e . --no-build-isolation
-pytest -q
+python -m pytest -q
 ```
 
 The distribution is named `rmsnorm-h100`; the import package is `rmsnorm`.
@@ -119,7 +122,7 @@ introduced. Neither library is a build or runtime dependency.
 Run all tests from the repository root:
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
 The suite checks CPU/reference fallbacks and CUDA forward/backward results
@@ -127,10 +130,10 @@ against FP32 PyTorch references across dtypes, residual modes, output dtypes,
 affine layouts, autograd, and large-row specialized kernels. CUDA tests require
 a GPU and are skipped when CUDA is unavailable.
 
-The verified GH200 run on June 8, 2026 passed:
+The verified GH200 run on July 8, 2026 passed:
 
 ```text
-48 passed, 65 subtests passed
+52 passed, 72 subtests passed
 ```
 
 ## Fair QuACK Benchmark
@@ -143,12 +146,15 @@ workspace/
 └── rmsnorm-h100/
 ```
 
-List or run the maintained gates:
+List maintained benchmark presets or run the gateable preset set:
 
 ```bash
 rmsnorm-benchmark --list-presets
 rmsnorm-benchmark --gate all --summary
 ```
+
+Rows listed with `gate_dtypes=none`, if any, are runnable focused presets but
+are not included in `--gate all`.
 
 Run focused comparisons:
 
@@ -160,8 +166,20 @@ rmsnorm-benchmark --dtype bfloat16 --residual \
   --residual-out-dtype float32 --summary
 ```
 
+`--quack-autotune fresh` is the default. Use `--quack-root` to select the exact
+checkout and `--quack-provenance-json` to record its revision, dirty state,
+version, and candidate counts.
+
 The benchmark is intentionally structured to avoid favorable special-casing:
 
+- QuACK is measured through its autotuned RMSNorm entry points for each
+  compared shape, dtype, and mode;
+- fresh mode bypasses QuACK's disk cache and benchmarks every launch-valid
+  candidate for each comparison key;
+- QuACK autotuning happens before the large timing pool is allocated, so valid
+  candidates are not rejected because the benchmark consumed device memory;
+- each CSV row records the selected QuACK configuration and provenance can be
+  emitted as JSON;
 - both providers receive the same tensor objects and valid `rstd` values;
 - random input pools rotate tensors during timing instead of reusing one input;
 - both providers are warmed before measurement;
@@ -171,64 +189,66 @@ The benchmark is intentionally structured to avoid favorable special-casing:
   stream, dtype, shape, and operation semantics are used for both providers;
 - unsupported QuACK rows are reported as unsupported and excluded from ratios,
   never counted as wins;
-- threshold gates fail the process if any comparable maintained row misses its
-  declared minimum speedup.
+- threshold gates fail the process if any comparable maintained row exceeds its
+  declared `fail_ratio` tolerance; current maintained gates use `1.01`.
 
 `ratio` is `rmsnorm_ms / quack_ms`; `speedup` is
 `quack_ms / rmsnorm_ms - 1`. Lower ratio and higher speedup are better.
 
 ### GH200 Results
 
-Measured June 8, 2026 on an NVIDIA GH200 480GB (`sm_90`), CUDA 13.2,
-PyTorch 2.12.0+cu132, with the default 10 warmup iterations, 100 repetitions,
-64-entry target input pool, memory cap, and balanced provider order.
+Measured July 8, 2026 on an NVIDIA GH200 480GB (`sm_90`), CUDA 13.2,
+PyTorch 2.12.0+cu132, with 10 warmup, 100 repetitions, a 64-entry target input
+pool subject to the memory cap, balanced provider order, and fresh per-key
+QuACK autotuning.
 
-| Preset | Dtype | Shape | rmsnorm ms | QuACK ms | Speedup |
-|---|---:|---:|---:|---:|---:|
-| mid-backward | bfloat16 | 32768x16384 | 0.934867 | 1.147325 | 22.73% |
-| mid-backward | float16 | 32768x16384 | 0.933622 | 1.114430 | 19.37% |
-| large-backward | bfloat16 | 32768x65536 | 4.315051 | 5.086070 | 17.87% |
-| large-backward | bfloat16 | 16384x131072 | 4.539361 | 6.008948 | 32.37% |
-| large-backward | bfloat16 | 8192x262144 | 3.859709 | 5.175591 | 34.09% |
-| large-backward | float16 | 32768x65536 | 4.342459 | 4.995056 | 15.03% |
-| large-backward | float16 | 16384x131072 | 4.507835 | 5.997536 | 33.05% |
-| large-backward | float16 | 8192x262144 | 3.849178 | 5.026853 | 30.60% |
+| Section | Rows | Min speedup | Geomean speedup | Max speedup |
+|---|---:|---:|---:|---:|
+| Forward BF16 | 11 | -1.23% | 1.45% | 15.10% |
+| Forward FP16 | 11 | -1.16% | 1.56% | 13.28% |
+| Forward FP32 | 11 | -1.21% | 0.03% | 2.71% |
+| Residual BF16 | 11 | -0.92% | 1.19% | 8.74% |
+| Residual FP16 | 11 | -0.99% | 1.52% | 8.39% |
+| FP32 residual output, BF16 input | 11 | -0.78% | 0.18% | 2.55% |
+| FP32 residual output, FP16 input | 11 | -0.80% | 0.34% | 4.38% |
 
-Balanced full-forward geometric-mean speedups across the 11 maintained shapes
-were 8.17% for BF16, 2.95% for FP16, and 1.16% for FP32. Every BF16 forward row
-was at least 0.35% faster than QuACK. The slowest FP16 and FP32 rows were 0.42%
-and 0.84% behind QuACK respectively; these are reported rather than hidden.
-BF16 residual-forward geometric-mean speedup was 5.76% for same-dtype residual
-output and 2.06% for FP32 residual output.
+The corrected audit found that FP32 `N=8192` and `N=32768` previously launched
+fewer threads than the kernel's row tile required. Those overrides were removed
+and the launcher now rejects `threads < threads_per_row`.
 
-Version 0.1.1 narrows the no-rstd FP16/BF16 CTA from 512 to 128 threads at
-`N=8192` and from 1024 to 512 threads at `N=32768`. Against the immediately
-preceding balanced baseline, package latency improved 1.83%/1.83% at `N=8192`
-and 1.91%/1.79% at `N=32768` for BF16/FP16 respectively. FP32, residual, and
-rstd-producing launches retain their previous dispatch.
+Post-baseline tuning removed the stale FP16 `N=65536` four-way split override.
+The existing eight-way kernel improved PTX latency from 2.398744 ms to
+2.380786 ms (0.75%), reducing the fresh QuACK deficit from 1.11% to 0.37%.
 
-Version 0.1.2 uses four cluster CTAs instead of eight for the FP16,
-weight-only, no-rstd `N=65536` path. Latency improved from 2.396176 ms to
-2.380595 ms (0.65%) against the immediately preceding balanced baseline, moving
-the row from parity to 0.65% faster than QuACK. The override is intentionally
-scoped away from residual fusion: same-dtype and FP32 residual-output checks
-remain 8.57% and 1.80% faster than QuACK, respectively.
+Nsight Compute found the remaining close losses to be primarily memory-bound.
+At FP16 `N=8192`, PTX reached 3.55 TB/s and 88.20% DRAM throughput; QuACK
+reached 3.58 TB/s and 89.00%. Lower-register, alternate-cluster, cache-policy,
+and shared-reload candidates were rejected when they failed the balanced
+rotating-pool benchmark.
 
-Nsight Compute measured the FP16 `N=32768` kernel at 89.84% of available DRAM
-throughput and only 20.30% compute throughput. Thread-count, cache-policy,
-weight-preload, persistent shared-weight, and alternate cluster experiments
-were rejected when they failed balanced benchmarks. This indicates the
-remaining large-row forward gap is primarily memory-bandwidth headroom rather
-than missing arithmetic optimization.
+The full methodology, backward table, correctness audit, tuning delta, rejected
+experiments, and artifact map are in
+[`benchmarks/results/2026-07-08-report.md`](benchmarks/results/2026-07-08-report.md).
+Raw CSV and provenance files are under:
 
-Raw CSV output is committed under `benchmarks/results/`:
+- `benchmarks/results/baseline-2026-07-08/`
+- `benchmarks/results/tuned-2026-07-08/`
+- `benchmarks/results/profile-2026-07-08/`
 
-- `gh200-2026-06-08-backward-gates.csv`
-- `gh200-2026-06-08-forward-{bfloat16,float16,float32}.csv`
-- `gh200-2026-06-08-residual-bfloat16.csv`
-- `gh200-2026-06-08-residual-fp32-bfloat16.csv`
-- `gh200-2026-06-08-residual-float16-n65536.csv`
-- `gh200-2026-06-08-residual-fp32-float16-n65536.csv`
+Historical pre-audit CSVs remain under `benchmarks/results/current/` for
+traceability. They are superseded by the July 8 audit:
+
+- `current/autotuned-quack-backward-bfloat16-large.csv`
+- `current/autotuned-quack-backward-bfloat16-mid.csv`
+- `current/autotuned-quack-backward-float16-large.csv`
+- `current/autotuned-quack-backward-float16-mid.csv`
+- `current/autotuned-quack-forward-bfloat16-over-65536-partial.csv`
+- `current/autotuned-quack-forward-float32-65536-row.csv`
+- `current/autotuned-quack-forward-{bfloat16,float16,float32}-through-65536.csv`
+- `current/autotuned-quack-residual-{bfloat16,float16}-16384-row.csv`
+- `current/autotuned-quack-residual-{bfloat16,float16}-through-65536.csv`
+- `current/autotuned-quack-residual-fp32-{bfloat16,float16}-16384-row.csv`
+- `current/autotuned-quack-residual-fp32-{bfloat16,float16}-through-65536.csv`
 
 Benchmark numbers are environment-specific and should be regenerated on the
 production driver, CUDA, PyTorch, and QuACK revisions used for deployment.
